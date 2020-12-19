@@ -203,7 +203,7 @@ func (prometheusCodec) DecodeRequest(_ context.Context, r *http.Request) (Reques
 	// For safety, limit the number of returned points per timeseries.
 	// This is sufficient for 60s resolution for a week or 1h resolution for a year.
 	// if (result.End-result.Start)/result.Step > 11000 {
-	if (result.End-result.Start)/result.Step > 88000 {
+	if (result.End-result.Start)/result.Step > 44000 {
 		return nil, errStepTooSmall
 	}
 
