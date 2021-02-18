@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	httpPort = 80
-	grpcPort = 9095
+	httpPort   = 80
+	grpcPort   = 9095
+	GossipPort = 9094
 )
 
 // GetDefaultImage returns the Docker image to use to run Cortex.
@@ -241,6 +242,39 @@ func NewQuerySchedulerWithConfigFile(name, configFile string, flags map[string]s
 	)
 }
 
+func NewCompactor(name string, consulAddress string, flags map[string]string, image string) *CortexService {
+	return NewCompactorWithConfigFile(name, consulAddress, "", flags, image)
+}
+
+func NewCompactorWithConfigFile(name, consulAddress, configFile string, flags map[string]string, image string) *CortexService {
+	if configFile != "" {
+		flags["-config.file"] = filepath.Join(e2e.ContainerSharedDir, configFile)
+	}
+
+	if image == "" {
+		image = GetDefaultImage()
+	}
+
+	return NewCortexService(
+		name,
+		image,
+		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
+			"-target":    "compactor",
+			"-log.level": "warn",
+			// Store-gateway ring backend.
+			"-compactor.sharding-enabled":     "true",
+			"-compactor.ring.store":           "consul",
+			"-compactor.ring.consul.hostname": consulAddress,
+			// Startup quickly.
+			"-compactor.ring.wait-stability-min-duration": "0",
+			"-compactor.ring.wait-stability-max-duration": "0",
+		}, flags))...),
+		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
+		httpPort,
+		grpcPort,
+	)
+}
+
 func NewSingleBinary(name string, flags map[string]string, image string, otherPorts ...int) *CortexService {
 	if image == "" {
 		image = GetDefaultImage()
@@ -312,6 +346,27 @@ func NewAlertmanager(name string, flags map[string]string, image string) *Cortex
 		e2e.NewHTTPReadinessProbe(httpPort, "/ready", 200, 299),
 		httpPort,
 		grpcPort,
+		GossipPort,
+	)
+}
+
+func NewAlertmanagerWithTLS(name string, flags map[string]string, image string) *CortexService {
+	if image == "" {
+		image = GetDefaultImage()
+	}
+
+	return NewCortexService(
+		name,
+		image,
+		e2e.NewCommandWithoutEntrypoint("cortex", e2e.BuildArgs(e2e.MergeFlags(map[string]string{
+			"-target":                               "alertmanager",
+			"-log.level":                            "warn",
+			"-experimental.alertmanager.enable-api": "true",
+		}, flags))...),
+		e2e.NewTCPReadinessProbe(httpPort),
+		httpPort,
+		grpcPort,
+		GossipPort,
 	)
 }
 

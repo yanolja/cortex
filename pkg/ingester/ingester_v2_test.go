@@ -1,6 +1,7 @@
 package ingester
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-kit/kit/log"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -39,6 +41,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/util"
+	util_math "github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -188,7 +191,7 @@ func TestIngester_v2Push(t *testing.T) {
 					nil,
 					client.API),
 			},
-			expectedErr: httpgrpc.Errorf(http.StatusBadRequest, wrapWithUser(errors.Wrapf(storage.ErrOutOfOrderSample, "series=%s, timestamp=%s", metricLabels.String(), model.Time(9).Time().UTC().Format(time.RFC3339Nano)), userID).Error()),
+			expectedErr: httpgrpc.Errorf(http.StatusBadRequest, wrapWithUser(wrappedTSDBIngestErr(storage.ErrOutOfOrderSample, model.Time(9), client.FromLabelsToLabelAdapters(metricLabels)), userID).Error()),
 			expectedIngested: []client.TimeSeries{
 				{Labels: metricLabelAdapters, Samples: []client.Sample{{Value: 2, TimestampMs: 10}}},
 			},
@@ -232,7 +235,7 @@ func TestIngester_v2Push(t *testing.T) {
 					nil,
 					client.API),
 			},
-			expectedErr: httpgrpc.Errorf(http.StatusBadRequest, wrapWithUser(errors.Wrapf(storage.ErrOutOfBounds, "series=%s, timestamp=%s", metricLabels.String(), model.Time(1575043969-(86400*1000)).Time().UTC().Format(time.RFC3339Nano)), userID).Error()),
+			expectedErr: httpgrpc.Errorf(http.StatusBadRequest, wrapWithUser(wrappedTSDBIngestErr(storage.ErrOutOfBounds, model.Time(1575043969-(86400*1000)), client.FromLabelsToLabelAdapters(metricLabels)), userID).Error()),
 			expectedIngested: []client.TimeSeries{
 				{Labels: metricLabelAdapters, Samples: []client.Sample{{Value: 2, TimestampMs: 1575043969}}},
 			},
@@ -276,7 +279,7 @@ func TestIngester_v2Push(t *testing.T) {
 					nil,
 					client.API),
 			},
-			expectedErr: httpgrpc.Errorf(http.StatusBadRequest, wrapWithUser(errors.Wrapf(storage.ErrDuplicateSampleForTimestamp, "series=%s, timestamp=%s", metricLabels.String(), model.Time(1575043969).Time().UTC().Format(time.RFC3339Nano)), userID).Error()),
+			expectedErr: httpgrpc.Errorf(http.StatusBadRequest, wrapWithUser(wrappedTSDBIngestErr(storage.ErrDuplicateSampleForTimestamp, model.Time(1575043969), client.FromLabelsToLabelAdapters(metricLabels)), userID).Error()),
 			expectedIngested: []client.TimeSeries{
 				{Labels: metricLabelAdapters, Samples: []client.Sample{{Value: 2, TimestampMs: 1575043969}}},
 			},
@@ -321,11 +324,10 @@ func TestIngester_v2Push(t *testing.T) {
 			cfg.LifecyclerConfig.JoinAfter = 0
 			cfg.ActiveSeriesMetricsEnabled = !testData.disableActiveSeries
 
-			i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, registry)
+			i, err := prepareIngesterWithBlocksStorage(t, cfg, registry)
 			require.NoError(t, err)
 			require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 			defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-			defer cleanup()
 
 			ctx := user.InjectOrgID(context.Background(), userID)
 
@@ -390,11 +392,10 @@ func TestIngester_v2Push_ShouldHandleTheCaseTheCachedReferenceIsInvalid(t *testi
 	cfg := defaultIngesterTestConfig()
 	cfg.LifecyclerConfig.JoinAfter = 0
 
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, nil)
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	ctx := user.InjectOrgID(context.Background(), userID)
 
@@ -463,11 +464,10 @@ func TestIngester_v2Push_ShouldCorrectlyTrackMetricsInMultiTenantScenario(t *tes
 	cfg := defaultIngesterTestConfig()
 	cfg.LifecyclerConfig.JoinAfter = 0
 
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, registry)
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, registry)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until the ingester is ACTIVE
 	test.Poll(t, 100*time.Millisecond, ring.ACTIVE, func() interface{} {
@@ -546,11 +546,10 @@ func TestIngester_v2Push_DecreaseInactiveSeries(t *testing.T) {
 	cfg.ActiveSeriesMetricsIdleTimeout = 100 * time.Millisecond
 	cfg.LifecyclerConfig.JoinAfter = 0
 
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, registry)
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, registry)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until the ingester is ACTIVE
 	test.Poll(t, 100*time.Millisecond, ring.ACTIVE, func() interface{} {
@@ -618,11 +617,10 @@ func Benchmark_Ingester_v2PushOnOutOfBoundsSamplesWithHighConcurrency(b *testing
 	cfg := defaultIngesterTestConfig()
 	cfg.LifecyclerConfig.JoinAfter = 0
 
-	ingester, cleanup, err := newIngesterMockWithTSDBStorage(cfg, registry)
+	ingester, err := prepareIngesterWithBlocksStorage(b, cfg, registry)
 	require.NoError(b, err)
 	require.NoError(b, services.StartAndAwaitRunning(context.Background(), ingester))
 	defer services.StopAndAwaitTerminated(context.Background(), ingester) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until the ingester is ACTIVE
 	test.Poll(b, 100*time.Millisecond, ring.ACTIVE, func() interface{} {
@@ -685,11 +683,10 @@ func Test_Ingester_v2LabelNames(t *testing.T) {
 	expected := []string{"__name__", "status", "route"}
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -730,11 +727,10 @@ func Test_Ingester_v2LabelValues(t *testing.T) {
 	}
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -850,11 +846,10 @@ func Test_Ingester_v2Query(t *testing.T) {
 	}
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -886,11 +881,10 @@ func Test_Ingester_v2Query(t *testing.T) {
 	}
 }
 func TestIngester_v2Query_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T) {
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Mock request
 	userID := "test"
@@ -907,11 +901,10 @@ func TestIngester_v2Query_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T) {
 }
 
 func TestIngester_v2LabelValues_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T) {
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Mock request
 	userID := "test"
@@ -928,11 +921,10 @@ func TestIngester_v2LabelValues_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T)
 }
 
 func TestIngester_v2LabelNames_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T) {
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Mock request
 	userID := "test"
@@ -954,11 +946,10 @@ func TestIngester_v2Push_ShouldNotCreateTSDBIfNotInActiveState(t *testing.T) {
 	cfg := defaultIngesterTestConfig()
 	cfg.LifecyclerConfig.JoinAfter = 10 * time.Second
 
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, nil)
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 	require.Equal(t, ring.PENDING, i.lifecycler.GetState())
 
 	// Mock request
@@ -1003,11 +994,10 @@ func TestIngester_getOrCreateTSDB_ShouldNotAllowToCreateTSDBIfIngesterStateIsNot
 			cfg := defaultIngesterTestConfig()
 			cfg.LifecyclerConfig.JoinAfter = 60 * time.Second
 
-			i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, nil)
+			i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
 			require.NoError(t, err)
 			require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 			defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-			defer cleanup()
 
 			// Switch ingester state to the expected one in the test
 			if i.lifecycler.GetState() != testData.state {
@@ -1150,11 +1140,10 @@ func Test_Ingester_v2MetricsForLabelMatchers(t *testing.T) {
 	}
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -1250,12 +1239,11 @@ func createIngesterWithSeries(t testing.TB, userID string, numSeries int, timest
 	const maxBatchSize = 1000
 
 	// Create ingester.
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	t.Cleanup(func() {
 		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), i))
-		cleanup()
 	})
 
 	// Wait until it's ACTIVE.
@@ -1267,7 +1255,7 @@ func createIngesterWithSeries(t testing.TB, userID string, numSeries int, timest
 	ctx := user.InjectOrgID(context.Background(), userID)
 
 	for o := 0; o < numSeries; o += maxBatchSize {
-		batchSize := util.Min(maxBatchSize, numSeries-o)
+		batchSize := util_math.Min(maxBatchSize, numSeries-o)
 
 		// Generate metrics and samples (1 for each series).
 		metrics := make([]labels.Labels, 0, batchSize)
@@ -1295,11 +1283,10 @@ func createIngesterWithSeries(t testing.TB, userID string, numSeries int, timest
 
 func TestIngester_v2QueryStream(t *testing.T) {
 	// Create ingester.
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE.
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -1358,11 +1345,10 @@ func TestIngester_v2QueryStream(t *testing.T) {
 
 func TestIngester_v2QueryStreamManySamples(t *testing.T) {
 	// Create ingester.
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE.
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -1479,11 +1465,10 @@ func (m *mockQueryStreamServer) Context() context.Context {
 
 func BenchmarkIngester_v2QueryStream(b *testing.B) {
 	// Create ingester.
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(b, defaultIngesterTestConfig(), nil)
 	require.NoError(b, err)
 	require.NoError(b, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE.
 	test.Poll(b, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -1562,24 +1547,29 @@ func mockWriteRequest(lbls labels.Labels, value float64, timestampMs int64) (*cl
 	return req, expectedQueryRes, expectedQueryStreamRes
 }
 
-func newIngesterMockWithTSDBStorage(ingesterCfg Config, registerer prometheus.Registerer) (*Ingester, func(), error) {
-	// Create a temporary directory for TSDB
-	tempDir, err := ioutil.TempDir("", "tsdb")
+func prepareIngesterWithBlocksStorage(t testing.TB, ingesterCfg Config, registerer prometheus.Registerer) (*Ingester, error) {
+	dataDir, err := ioutil.TempDir("", "ingester")
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	// Create a cleanup function that the caller should call with defer
-	cleanup := func() {
-		os.RemoveAll(tempDir)
-	}
+	t.Cleanup(func() {
+		require.NoError(t, os.RemoveAll(dataDir))
+	})
 
-	ingester, err := newIngesterMockWithTSDBStorageAndLimits(ingesterCfg, defaultLimitsTestConfig(), tempDir, registerer)
-
-	return ingester, cleanup, err
+	return prepareIngesterWithBlocksStorageAndLimits(t, ingesterCfg, defaultLimitsTestConfig(), dataDir, registerer)
 }
 
-func newIngesterMockWithTSDBStorageAndLimits(ingesterCfg Config, limits validation.Limits, dir string, registerer prometheus.Registerer) (*Ingester, error) {
+func prepareIngesterWithBlocksStorageAndLimits(t testing.TB, ingesterCfg Config, limits validation.Limits, dataDir string, registerer prometheus.Registerer) (*Ingester, error) {
+	bucketDir, err := ioutil.TempDir("", "bucket")
+	if err != nil {
+		return nil, err
+	}
+
+	t.Cleanup(func() {
+		require.NoError(t, os.RemoveAll(bucketDir))
+	})
+
 	clientCfg := defaultClientTestConfig()
 
 	overrides, err := validation.NewOverrides(limits, nil)
@@ -1588,11 +1578,11 @@ func newIngesterMockWithTSDBStorageAndLimits(ingesterCfg Config, limits validati
 	}
 
 	ingesterCfg.BlocksStorageEnabled = true
-	ingesterCfg.BlocksStorageConfig.TSDB.Dir = dir
-	ingesterCfg.BlocksStorageConfig.Bucket.Backend = "s3"
-	ingesterCfg.BlocksStorageConfig.Bucket.S3.Endpoint = "localhost"
+	ingesterCfg.BlocksStorageConfig.TSDB.Dir = dataDir
+	ingesterCfg.BlocksStorageConfig.Bucket.Backend = "filesystem"
+	ingesterCfg.BlocksStorageConfig.Bucket.Filesystem.Directory = bucketDir
 
-	ingester, err := NewV2(ingesterCfg, clientCfg, overrides, registerer)
+	ingester, err := NewV2(ingesterCfg, clientCfg, overrides, registerer, log.NewNopLogger())
 	if err != nil {
 		return nil, err
 	}
@@ -1737,7 +1727,7 @@ func TestIngester_v2OpenExistingTSDBOnStartup(t *testing.T) {
 			// setup the tsdbs dir
 			testData.setup(t, tempDir)
 
-			ingester, err := NewV2(ingesterCfg, clientCfg, overrides, nil)
+			ingester, err := NewV2(ingesterCfg, clientCfg, overrides, nil, log.NewNopLogger())
 			require.NoError(t, err)
 
 			startErr := services.StartAndAwaitRunning(context.Background(), ingester)
@@ -1760,11 +1750,10 @@ func TestIngester_shipBlocks(t *testing.T) {
 	cfg.BlocksStorageConfig.TSDB.ShipConcurrency = 2
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, nil)
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -1799,7 +1788,7 @@ func TestIngester_dontShipBlocksWhenTenantDeletionMarkerIsPresent(t *testing.T) 
 	cfg.BlocksStorageConfig.TSDB.ShipConcurrency = 2
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, nil)
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
 	require.NoError(t, err)
 
 	// Use in-memory bucket.
@@ -1808,21 +1797,20 @@ func TestIngester_dontShipBlocksWhenTenantDeletionMarkerIsPresent(t *testing.T) 
 	i.TSDBState.bucket = bucket
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
 		return i.lifecycler.GetState()
 	})
 
-	pushSingleSample(t, i)
+	pushSingleSampleWithMetadata(t, i)
 	i.compactBlocks(context.Background(), true)
 	i.shipBlocks(context.Background())
 
 	numObjects := len(bucket.Objects())
 	require.NotZero(t, numObjects)
 
-	require.NoError(t, cortex_tsdb.WriteTenantDeletionMark(context.Background(), bucket, userID))
+	require.NoError(t, cortex_tsdb.WriteTenantDeletionMark(context.Background(), bucket, userID, cortex_tsdb.NewTenantDeletionMark(time.Now())))
 	numObjects++ // For deletion marker
 
 	db := i.getTSDB(userID)
@@ -1830,13 +1818,96 @@ func TestIngester_dontShipBlocksWhenTenantDeletionMarkerIsPresent(t *testing.T) 
 	db.lastDeletionMarkCheck.Store(0)
 
 	// After writing tenant deletion mark,
-	pushSingleSample(t, i)
+	pushSingleSampleWithMetadata(t, i)
 	i.compactBlocks(context.Background(), true)
 	i.shipBlocks(context.Background())
 
 	numObjectsAfterMarkingTenantForDeletion := len(bucket.Objects())
 	require.Equal(t, numObjects, numObjectsAfterMarkingTenantForDeletion)
 	require.Equal(t, tsdbTenantMarkedForDeletion, i.closeAndDeleteUserTSDBIfIdle(userID))
+}
+
+func TestIngester_closeAndDeleteUserTSDBIfIdle_shouldNotCloseTSDBIfShippingIsInProgress(t *testing.T) {
+	ctx := context.Background()
+	cfg := defaultIngesterTestConfig()
+	cfg.LifecyclerConfig.JoinAfter = 0
+	cfg.BlocksStorageConfig.TSDB.ShipConcurrency = 2
+
+	// Create ingester
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, services.StartAndAwaitRunning(ctx, i))
+	defer services.StopAndAwaitTerminated(ctx, i) //nolint:errcheck
+
+	// Wait until it's ACTIVE
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
+		return i.lifecycler.GetState()
+	})
+
+	// Mock the shipper to slow down Sync() execution.
+	s := mockUserShipper(t, i)
+	s.On("Sync", mock.Anything).Run(func(args mock.Arguments) {
+		time.Sleep(3 * time.Second)
+	}).Return(0, nil)
+
+	// Mock the shipper meta (no blocks).
+	db := i.getTSDB(userID)
+	require.NoError(t, shipper.WriteMetaFile(log.NewNopLogger(), db.db.Dir(), &shipper.Meta{
+		Version: shipper.MetaVersion1,
+	}))
+
+	// Run blocks shipping in a separate go routine.
+	go i.shipBlocks(ctx)
+
+	// Wait until shipping starts.
+	test.Poll(t, 1*time.Second, activeShipping, func() interface{} {
+		db.stateMtx.RLock()
+		defer db.stateMtx.RUnlock()
+		return db.state
+	})
+
+	assert.Equal(t, tsdbNotActive, i.closeAndDeleteUserTSDBIfIdle(userID))
+}
+
+func TestIngester_idleCloseEmptyTSDB(t *testing.T) {
+	ctx := context.Background()
+	cfg := defaultIngesterTestConfig()
+	cfg.BlocksStorageConfig.TSDB.ShipInterval = 1 * time.Minute
+	cfg.BlocksStorageConfig.TSDB.HeadCompactionInterval = 1 * time.Minute
+	cfg.BlocksStorageConfig.TSDB.CloseIdleTSDBTimeout = 0 // Will not run the loop, but will allow us to close any TSDB fast.
+
+	// Create ingester
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, services.StartAndAwaitRunning(ctx, i))
+	defer services.StopAndAwaitTerminated(ctx, i) //nolint:errcheck
+
+	// Wait until it's ACTIVE
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
+		return i.lifecycler.GetState()
+	})
+
+	db, err := i.getOrCreateTSDB(userID, true)
+	require.NoError(t, err)
+	require.NotNil(t, db)
+
+	// Run compaction and shipping.
+	i.compactBlocks(context.Background(), true)
+	i.shipBlocks(context.Background())
+
+	// Make sure we can close completely empty TSDB without problems.
+	require.Equal(t, tsdbIdleClosed, i.closeAndDeleteUserTSDBIfIdle(userID))
+
+	// Verify that it was closed.
+	db = i.getTSDB(userID)
+	require.Nil(t, db)
+
+	// And we can recreate it again, if needed.
+	db, err = i.getOrCreateTSDB(userID, true)
+	require.NoError(t, err)
+	require.NotNil(t, db)
 }
 
 type shipperMock struct {
@@ -1849,21 +1920,69 @@ func (m *shipperMock) Sync(ctx context.Context) (uploaded int, err error) {
 	return args.Int(0), args.Error(1)
 }
 
+func TestIngester_invalidSamplesDontChangeLastUpdateTime(t *testing.T) {
+	cfg := defaultIngesterTestConfig()
+	cfg.LifecyclerConfig.JoinAfter = 0
+
+	// Create ingester
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
+
+	// Wait until it's ACTIVE
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
+		return i.lifecycler.GetState()
+	})
+
+	ctx := user.InjectOrgID(context.Background(), userID)
+	sampleTimestamp := int64(model.Now())
+
+	{
+		req, _, _ := mockWriteRequest(labels.Labels{{Name: labels.MetricName, Value: "test"}}, 0, sampleTimestamp)
+		_, err = i.v2Push(ctx, req)
+		require.NoError(t, err)
+	}
+
+	db := i.getTSDB(userID)
+	lastUpdate := db.lastUpdate.Load()
+
+	// Wait until 1 second passes.
+	test.Poll(t, 1*time.Second, time.Now().Unix()+1, func() interface{} {
+		return time.Now().Unix()
+	})
+
+	// Push another sample to the same metric and timestamp, with different value. We expect to get error.
+	{
+		req, _, _ := mockWriteRequest(labels.Labels{{Name: labels.MetricName, Value: "test"}}, 1, sampleTimestamp)
+		_, err = i.v2Push(ctx, req)
+		require.Error(t, err)
+	}
+
+	// Make sure last update hasn't changed.
+	require.Equal(t, lastUpdate, db.lastUpdate.Load())
+}
+
 func TestIngester_flushing(t *testing.T) {
 	for name, tc := range map[string]struct {
 		setupIngester func(cfg *Config)
-		action        func(t *testing.T, i *Ingester, m *shipperMock)
+		action        func(t *testing.T, i *Ingester, reg *prometheus.Registry)
 	}{
 		"ingesterShutdown": {
 			setupIngester: func(cfg *Config) {
 				cfg.BlocksStorageConfig.TSDB.FlushBlocksOnShutdown = true
 				cfg.BlocksStorageConfig.TSDB.KeepUserTSDBOpenOnShutdown = true
 			},
-			action: func(t *testing.T, i *Ingester, m *shipperMock) {
-				pushSingleSample(t, i)
+			action: func(t *testing.T, i *Ingester, reg *prometheus.Registry) {
+				pushSingleSampleWithMetadata(t, i)
 
 				// Nothing shipped yet.
-				m.AssertNumberOfCalls(t, "Sync", 0)
+				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+					# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+					# TYPE cortex_ingester_shipper_uploads_total counter
+					cortex_ingester_shipper_uploads_total 0
+				`), "cortex_ingester_shipper_uploads_total"))
 
 				// Shutdown ingester. This triggers flushing of the block.
 				require.NoError(t, services.StopAndAwaitTerminated(context.Background(), i))
@@ -1871,7 +1990,11 @@ func TestIngester_flushing(t *testing.T) {
 				verifyCompactedHead(t, i, true)
 
 				// Verify that block has been shipped.
-				m.AssertNumberOfCalls(t, "Sync", 1)
+				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+					# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+					# TYPE cortex_ingester_shipper_uploads_total counter
+					cortex_ingester_shipper_uploads_total 1
+				`), "cortex_ingester_shipper_uploads_total"))
 			},
 		},
 
@@ -1881,16 +2004,24 @@ func TestIngester_flushing(t *testing.T) {
 				cfg.BlocksStorageConfig.TSDB.KeepUserTSDBOpenOnShutdown = true
 			},
 
-			action: func(t *testing.T, i *Ingester, m *shipperMock) {
-				pushSingleSample(t, i)
+			action: func(t *testing.T, i *Ingester, reg *prometheus.Registry) {
+				pushSingleSampleWithMetadata(t, i)
 
 				// Nothing shipped yet.
-				m.AssertNumberOfCalls(t, "Sync", 0)
+				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+		# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+		# TYPE cortex_ingester_shipper_uploads_total counter
+		cortex_ingester_shipper_uploads_total 0
+	`), "cortex_ingester_shipper_uploads_total"))
 
 				i.ShutdownHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/shutdown", nil))
 
 				verifyCompactedHead(t, i, true)
-				m.AssertNumberOfCalls(t, "Sync", 1)
+				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+		# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+		# TYPE cortex_ingester_shipper_uploads_total counter
+		cortex_ingester_shipper_uploads_total 1
+	`), "cortex_ingester_shipper_uploads_total"))
 			},
 		},
 
@@ -1899,11 +2030,15 @@ func TestIngester_flushing(t *testing.T) {
 				cfg.BlocksStorageConfig.TSDB.FlushBlocksOnShutdown = false
 			},
 
-			action: func(t *testing.T, i *Ingester, m *shipperMock) {
-				pushSingleSample(t, i)
+			action: func(t *testing.T, i *Ingester, reg *prometheus.Registry) {
+				pushSingleSampleWithMetadata(t, i)
 
 				// Nothing shipped yet.
-				m.AssertNumberOfCalls(t, "Sync", 0)
+				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+					# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+					# TYPE cortex_ingester_shipper_uploads_total counter
+					cortex_ingester_shipper_uploads_total 0
+				`), "cortex_ingester_shipper_uploads_total"))
 
 				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush", nil))
 
@@ -1920,7 +2055,11 @@ func TestIngester_flushing(t *testing.T) {
 				time.Sleep(1 * time.Second)
 
 				verifyCompactedHead(t, i, true)
-				m.AssertNumberOfCalls(t, "Sync", 1)
+				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+					# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+					# TYPE cortex_ingester_shipper_uploads_total counter
+					cortex_ingester_shipper_uploads_total 1
+				`), "cortex_ingester_shipper_uploads_total"))
 			},
 		},
 
@@ -1929,7 +2068,7 @@ func TestIngester_flushing(t *testing.T) {
 				cfg.BlocksStorageConfig.TSDB.FlushBlocksOnShutdown = false
 			},
 
-			action: func(t *testing.T, i *Ingester, m *shipperMock) {
+			action: func(t *testing.T, i *Ingester, reg *prometheus.Registry) {
 				// Pushing 5 samples, spanning over 3 days.
 				// First block
 				pushSingleSampleAtTime(t, i, 23*time.Hour.Milliseconds())
@@ -1943,7 +2082,11 @@ func TestIngester_flushing(t *testing.T) {
 				pushSingleSampleAtTime(t, i, 50*time.Hour.Milliseconds())
 
 				// Nothing shipped yet.
-				m.AssertNumberOfCalls(t, "Sync", 0)
+				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+					# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+					# TYPE cortex_ingester_shipper_uploads_total counter
+					cortex_ingester_shipper_uploads_total 0
+				`), "cortex_ingester_shipper_uploads_total"))
 
 				i.FlushHandler(httptest.NewRecorder(), httptest.NewRequest("POST", "/flush", nil))
 
@@ -1961,7 +2104,11 @@ func TestIngester_flushing(t *testing.T) {
 
 				verifyCompactedHead(t, i, true)
 
-				m.AssertNumberOfCalls(t, "Sync", 1)
+				require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+					# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+					# TYPE cortex_ingester_shipper_uploads_total counter
+					cortex_ingester_shipper_uploads_total 3
+				`), "cortex_ingester_shipper_uploads_total"))
 
 				userDB := i.getTSDB(userID)
 				require.NotNil(t, userDB)
@@ -1971,9 +2118,7 @@ func TestIngester_flushing(t *testing.T) {
 				require.Equal(t, 23*time.Hour.Milliseconds(), blocks[0].Meta().MinTime)
 				require.Equal(t, 24*time.Hour.Milliseconds(), blocks[0].Meta().MaxTime) // Block maxt is exclusive.
 
-				// Even though we added 24*time.Hour.Milliseconds()+1, the Head compaction
-				// will leave Head's mint to 24*time.Hour.Milliseconds(). Hence the block mint.
-				require.Equal(t, 24*time.Hour.Milliseconds(), blocks[1].Meta().MinTime)
+				require.Equal(t, 24*time.Hour.Milliseconds()+1, blocks[1].Meta().MinTime)
 				require.Equal(t, 26*time.Hour.Milliseconds(), blocks[1].Meta().MaxTime)
 
 				require.Equal(t, 50*time.Hour.Milliseconds()+1, blocks[2].Meta().MaxTime) // Block maxt is exclusive.
@@ -1991,9 +2136,9 @@ func TestIngester_flushing(t *testing.T) {
 			}
 
 			// Create ingester
-			i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, nil)
+			reg := prometheus.NewPedanticRegistry()
+			i, err := prepareIngesterWithBlocksStorage(t, cfg, reg)
 			require.NoError(t, err)
-			t.Cleanup(cleanup)
 
 			require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 			t.Cleanup(func() {
@@ -2006,10 +2151,7 @@ func TestIngester_flushing(t *testing.T) {
 			})
 
 			// mock user's shipper
-			m := mockUserShipper(t, i)
-			m.On("Sync", mock.Anything).Return(0, nil)
-
-			tc.action(t, i, m)
+			tc.action(t, i, reg)
 		})
 	}
 }
@@ -2021,9 +2163,9 @@ func TestIngester_ForFlush(t *testing.T) {
 	cfg.BlocksStorageConfig.TSDB.ShipInterval = 10 * time.Minute // Long enough to not be reached during the test.
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, nil)
+	reg := prometheus.NewPedanticRegistry()
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, reg)
 	require.NoError(t, err)
-	t.Cleanup(cleanup)
 
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	t.Cleanup(func() {
@@ -2035,26 +2177,24 @@ func TestIngester_ForFlush(t *testing.T) {
 		return i.lifecycler.GetState()
 	})
 
-	// mock user's shipper
-	m := mockUserShipper(t, i)
-	m.On("Sync", mock.Anything).Return(0, nil)
-
 	// Push some data.
-	pushSingleSample(t, i)
+	pushSingleSampleWithMetadata(t, i)
 
 	// Stop ingester.
 	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), i))
 
 	// Nothing shipped yet.
-	m.AssertNumberOfCalls(t, "Sync", 0)
+	require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+		# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+		# TYPE cortex_ingester_shipper_uploads_total counter
+		cortex_ingester_shipper_uploads_total 0
+	`), "cortex_ingester_shipper_uploads_total"))
 
 	// Restart ingester in "For Flusher" mode. We reuse the same config (esp. same dir)
-	i, err = NewV2ForFlusher(i.cfg, nil)
+	reg = prometheus.NewPedanticRegistry()
+	i, err = NewV2ForFlusher(i.cfg, reg, log.NewNopLogger())
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
-
-	m = mockUserShipper(t, i)
-	m.On("Sync", mock.Anything).Return(0, nil)
 
 	// Our single sample should be reloaded from WAL
 	verifyCompactedHead(t, i, false)
@@ -2064,7 +2204,11 @@ func TestIngester_ForFlush(t *testing.T) {
 	verifyCompactedHead(t, i, true)
 
 	// Verify that block has been shipped.
-	m.AssertNumberOfCalls(t, "Sync", 1)
+	require.NoError(t, testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+		# HELP cortex_ingester_shipper_uploads_total Total number of uploaded TSDB blocks
+		# TYPE cortex_ingester_shipper_uploads_total counter
+		cortex_ingester_shipper_uploads_total 1
+	`), "cortex_ingester_shipper_uploads_total"))
 
 	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), i))
 }
@@ -2091,11 +2235,10 @@ func Test_Ingester_v2UserStats(t *testing.T) {
 	}
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -2140,11 +2283,10 @@ func Test_Ingester_v2AllUserStats(t *testing.T) {
 	}
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
-	defer cleanup()
 
 	// Wait until it's ACTIVE
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
@@ -2200,9 +2342,8 @@ func TestIngesterCompactIdleBlock(t *testing.T) {
 	r := prometheus.NewRegistry()
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, r)
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, r)
 	require.NoError(t, err)
-	t.Cleanup(cleanup)
 
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	t.Cleanup(func() {
@@ -2214,7 +2355,7 @@ func TestIngesterCompactIdleBlock(t *testing.T) {
 		return i.lifecycler.GetState()
 	})
 
-	pushSingleSample(t, i)
+	pushSingleSampleWithMetadata(t, i)
 
 	i.compactBlocks(context.Background(), false)
 	verifyCompactedHead(t, i, false)
@@ -2226,7 +2367,11 @@ func TestIngesterCompactIdleBlock(t *testing.T) {
 		# HELP cortex_ingester_memory_series_removed_total The total number of series that were removed per user.
 		# TYPE cortex_ingester_memory_series_removed_total counter
 		cortex_ingester_memory_series_removed_total{user="1"} 0
-    `), memSeriesCreatedTotalName, memSeriesRemovedTotalName))
+
+		# HELP cortex_ingester_memory_users The current number of users in memory.
+		# TYPE cortex_ingester_memory_users gauge
+		cortex_ingester_memory_users 1
+    `), memSeriesCreatedTotalName, memSeriesRemovedTotalName, "cortex_ingester_memory_users"))
 
 	// wait one second -- TSDB is now idle.
 	time.Sleep(cfg.BlocksStorageConfig.TSDB.HeadCompactionIdleTimeout)
@@ -2241,10 +2386,14 @@ func TestIngesterCompactIdleBlock(t *testing.T) {
 		# HELP cortex_ingester_memory_series_removed_total The total number of series that were removed per user.
 		# TYPE cortex_ingester_memory_series_removed_total counter
 		cortex_ingester_memory_series_removed_total{user="1"} 1
-    `), memSeriesCreatedTotalName, memSeriesRemovedTotalName))
+
+		# HELP cortex_ingester_memory_users The current number of users in memory.
+		# TYPE cortex_ingester_memory_users gauge
+		cortex_ingester_memory_users 1
+    `), memSeriesCreatedTotalName, memSeriesRemovedTotalName, "cortex_ingester_memory_users"))
 
 	// Pushing another sample still works.
-	pushSingleSample(t, i)
+	pushSingleSampleWithMetadata(t, i)
 	verifyCompactedHead(t, i, false)
 
 	require.NoError(t, testutil.GatherAndCompare(r, strings.NewReader(`
@@ -2255,7 +2404,11 @@ func TestIngesterCompactIdleBlock(t *testing.T) {
 		# HELP cortex_ingester_memory_series_removed_total The total number of series that were removed per user.
 		# TYPE cortex_ingester_memory_series_removed_total counter
 		cortex_ingester_memory_series_removed_total{user="1"} 1
-    `), memSeriesCreatedTotalName, memSeriesRemovedTotalName))
+
+		# HELP cortex_ingester_memory_users The current number of users in memory.
+		# TYPE cortex_ingester_memory_users gauge
+		cortex_ingester_memory_users 1
+    `), memSeriesCreatedTotalName, memSeriesRemovedTotalName, "cortex_ingester_memory_users"))
 }
 
 func TestIngesterCompactAndCloseIdleTSDB(t *testing.T) {
@@ -2266,18 +2419,17 @@ func TestIngesterCompactAndCloseIdleTSDB(t *testing.T) {
 	cfg.BlocksStorageConfig.TSDB.HeadCompactionInterval = 1 * time.Second
 	cfg.BlocksStorageConfig.TSDB.HeadCompactionIdleTimeout = 1 * time.Second
 	cfg.BlocksStorageConfig.TSDB.CloseIdleTSDBTimeout = 1 * time.Second
-	cfg.BlocksStorageConfig.TSDB.CloseIdleTSDBInterval = 1 * time.Second
+	cfg.BlocksStorageConfig.TSDB.CloseIdleTSDBInterval = 100 * time.Millisecond
 
 	r := prometheus.NewRegistry()
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, r)
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, r)
 	require.NoError(t, err)
-	t.Cleanup(cleanup)
 
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	t.Cleanup(func() {
-		_ = services.StopAndAwaitTerminated(context.Background(), i)
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), i))
 	})
 
 	// Wait until it's ACTIVE
@@ -2285,10 +2437,11 @@ func TestIngesterCompactAndCloseIdleTSDB(t *testing.T) {
 		return i.lifecycler.GetState()
 	})
 
-	m := mockUserShipper(t, i)
-	m.On("Sync", mock.Anything).Return(0, nil)
+	pushSingleSampleWithMetadata(t, i)
+	i.v2UpdateActiveSeries()
 
-	pushSingleSample(t, i)
+	metricsToCheck := []string{memSeriesCreatedTotalName, memSeriesRemovedTotalName, "cortex_ingester_memory_users", "cortex_ingester_active_series",
+		"cortex_ingester_memory_metadata", "cortex_ingester_memory_metadata_created_total", "cortex_ingester_memory_metadata_removed_total"}
 
 	require.NoError(t, testutil.GatherAndCompare(r, strings.NewReader(`
 		# HELP cortex_ingester_memory_series_created_total The total number of series that were created per user.
@@ -2298,29 +2451,33 @@ func TestIngesterCompactAndCloseIdleTSDB(t *testing.T) {
 		# HELP cortex_ingester_memory_series_removed_total The total number of series that were removed per user.
 		# TYPE cortex_ingester_memory_series_removed_total counter
 		cortex_ingester_memory_series_removed_total{user="1"} 0
-    `), memSeriesCreatedTotalName, memSeriesRemovedTotalName))
 
-	// Wait until idle TSDB is force-compacted, shipped, and eventually closed and removed.
+		# HELP cortex_ingester_memory_users The current number of users in memory.
+		# TYPE cortex_ingester_memory_users gauge
+		cortex_ingester_memory_users 1
+
+		# HELP cortex_ingester_active_series Number of currently active series per user.
+		# TYPE cortex_ingester_active_series gauge
+		cortex_ingester_active_series{user="1"} 1
+
+		# HELP cortex_ingester_memory_metadata The current number of metadata in memory.
+		# TYPE cortex_ingester_memory_metadata gauge
+		cortex_ingester_memory_metadata 1
+
+		# HELP cortex_ingester_memory_metadata_created_total The total number of metadata that were created per user
+		# TYPE cortex_ingester_memory_metadata_created_total counter
+		cortex_ingester_memory_metadata_created_total{user="1"} 1
+    `), metricsToCheck...))
+
+	// Wait until TSDB has been closed and removed.
 	test.Poll(t, 10*time.Second, 0, func() interface{} {
-		db := i.getTSDB(userID)
-		if db != nil {
-			// Simulate shipper updating metadata file.
-			meta := &shipper.Meta{Version: shipper.MetaVersion1}
-
-			blocks := db.Blocks()
-			for _, b := range blocks {
-				meta.Uploaded = append(meta.Uploaded, b.Meta().ULID)
-			}
-
-			require.NoError(t, shipper.WriteMetaFile(util.Logger, db.db.Dir(), meta))
-		}
-
 		i.userStatesMtx.Lock()
 		defer i.userStatesMtx.Unlock()
 		return len(i.TSDBState.dbs)
 	})
 
 	require.Greater(t, testutil.ToFloat64(i.TSDBState.idleTsdbChecks.WithLabelValues(string(tsdbIdleClosed))), float64(0))
+	i.v2UpdateActiveSeries()
 
 	// Verify that user has disappeared from metrics.
 	require.NoError(t, testutil.GatherAndCompare(r, strings.NewReader(`
@@ -2329,10 +2486,22 @@ func TestIngesterCompactAndCloseIdleTSDB(t *testing.T) {
 
 		# HELP cortex_ingester_memory_series_removed_total The total number of series that were removed per user.
 		# TYPE cortex_ingester_memory_series_removed_total counter
-    `), memSeriesCreatedTotalName, memSeriesRemovedTotalName))
+
+		# HELP cortex_ingester_memory_users The current number of users in memory.
+		# TYPE cortex_ingester_memory_users gauge
+		cortex_ingester_memory_users 0
+
+		# HELP cortex_ingester_active_series Number of currently active series per user.
+		# TYPE cortex_ingester_active_series gauge
+
+		# HELP cortex_ingester_memory_metadata The current number of metadata in memory.
+		# TYPE cortex_ingester_memory_metadata gauge
+		cortex_ingester_memory_metadata 0
+    `), metricsToCheck...))
 
 	// Pushing another sample will recreate TSDB.
-	pushSingleSample(t, i)
+	pushSingleSampleWithMetadata(t, i)
+	i.v2UpdateActiveSeries()
 
 	// User is back.
 	require.NoError(t, testutil.GatherAndCompare(r, strings.NewReader(`
@@ -2343,7 +2512,23 @@ func TestIngesterCompactAndCloseIdleTSDB(t *testing.T) {
 		# HELP cortex_ingester_memory_series_removed_total The total number of series that were removed per user.
 		# TYPE cortex_ingester_memory_series_removed_total counter
 		cortex_ingester_memory_series_removed_total{user="1"} 0
-    `), memSeriesCreatedTotalName, memSeriesRemovedTotalName))
+
+		# HELP cortex_ingester_memory_users The current number of users in memory.
+		# TYPE cortex_ingester_memory_users gauge
+		cortex_ingester_memory_users 1
+
+		# HELP cortex_ingester_active_series Number of currently active series per user.
+		# TYPE cortex_ingester_active_series gauge
+		cortex_ingester_active_series{user="1"} 1
+
+		# HELP cortex_ingester_memory_metadata The current number of metadata in memory.
+		# TYPE cortex_ingester_memory_metadata gauge
+		cortex_ingester_memory_metadata 1
+
+		# HELP cortex_ingester_memory_metadata_created_total The total number of metadata that were created per user
+		# TYPE cortex_ingester_memory_metadata_created_total counter
+		cortex_ingester_memory_metadata_created_total{user="1"} 1
+    `), metricsToCheck...))
 }
 
 func verifyCompactedHead(t *testing.T, i *Ingester, expected bool) {
@@ -2354,9 +2539,10 @@ func verifyCompactedHead(t *testing.T, i *Ingester, expected bool) {
 	require.Equal(t, expected, h.NumSeries() == 0)
 }
 
-func pushSingleSample(t *testing.T, i *Ingester) {
+func pushSingleSampleWithMetadata(t *testing.T, i *Ingester) {
 	ctx := user.InjectOrgID(context.Background(), userID)
 	req, _, _ := mockWriteRequest(labels.Labels{{Name: labels.MetricName, Value: "test"}}, 0, util.TimeToMillis(time.Now()))
+	req.Metadata = append(req.Metadata, &client.MetricMetadata{MetricFamilyName: "test", Help: "a help for metric", Unit: "", Type: client.COUNTER})
 	_, err := i.v2Push(ctx, req)
 	require.NoError(t, err)
 }
@@ -2426,7 +2612,7 @@ func TestHeadCompactionOnStartup(t *testing.T) {
 	ingesterCfg.BlocksStorageConfig.Bucket.S3.Endpoint = "localhost"
 	ingesterCfg.BlocksStorageConfig.TSDB.Retention = 2 * 24 * time.Hour // Make sure that no newly created blocks are deleted.
 
-	ingester, err := NewV2(ingesterCfg, clientCfg, overrides, nil)
+	ingester, err := NewV2(ingesterCfg, clientCfg, overrides, nil, log.NewNopLogger())
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), ingester))
 
@@ -2447,9 +2633,8 @@ func TestIngester_CloseTSDBsOnShutdown(t *testing.T) {
 	cfg.LifecyclerConfig.JoinAfter = 0
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, nil)
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, nil)
 	require.NoError(t, err)
-	t.Cleanup(cleanup)
 
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	t.Cleanup(func() {
@@ -2462,7 +2647,7 @@ func TestIngester_CloseTSDBsOnShutdown(t *testing.T) {
 	})
 
 	// Push some data.
-	pushSingleSample(t, i)
+	pushSingleSampleWithMetadata(t, i)
 
 	db := i.getTSDB(userID)
 	require.NotNil(t, db)
@@ -2484,9 +2669,9 @@ func TestIngesterNotDeleteUnshippedBlocks(t *testing.T) {
 	cfg.LifecyclerConfig.JoinAfter = 0
 
 	// Create ingester
-	i, cleanup, err := newIngesterMockWithTSDBStorage(cfg, nil)
+	reg := prometheus.NewPedanticRegistry()
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, reg)
 	require.NoError(t, err)
-	t.Cleanup(cleanup)
 
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	t.Cleanup(func() {
@@ -2497,6 +2682,12 @@ func TestIngesterNotDeleteUnshippedBlocks(t *testing.T) {
 	test.Poll(t, 1*time.Second, ring.ACTIVE, func() interface{} {
 		return i.lifecycler.GetState()
 	})
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP cortex_ingester_oldest_unshipped_block_timestamp_seconds Unix timestamp of the oldest TSDB block not shipped to the storage yet. 0 if ingester has no blocks or all blocks have been shipped.
+		# TYPE cortex_ingester_oldest_unshipped_block_timestamp_seconds gauge
+		cortex_ingester_oldest_unshipped_block_timestamp_seconds 0
+	`), "cortex_ingester_oldest_unshipped_block_timestamp_seconds"))
 
 	// Push some data to create 3 blocks.
 	ctx := user.InjectOrgID(context.Background(), userID)
@@ -2513,11 +2704,18 @@ func TestIngesterNotDeleteUnshippedBlocks(t *testing.T) {
 	oldBlocks := db.Blocks()
 	require.Equal(t, 3, len(oldBlocks))
 
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+		# HELP cortex_ingester_oldest_unshipped_block_timestamp_seconds Unix timestamp of the oldest TSDB block not shipped to the storage yet. 0 if ingester has no blocks or all blocks have been shipped.
+		# TYPE cortex_ingester_oldest_unshipped_block_timestamp_seconds gauge
+		cortex_ingester_oldest_unshipped_block_timestamp_seconds %d
+	`, oldBlocks[0].Meta().ULID.Time()/1000)), "cortex_ingester_oldest_unshipped_block_timestamp_seconds"))
+
 	// Saying that we have shipped the second block, so only that should get deleted.
 	require.Nil(t, shipper.WriteMetaFile(nil, db.db.Dir(), &shipper.Meta{
 		Version:  shipper.MetaVersion1,
 		Uploaded: []ulid.ULID{oldBlocks[1].Meta().ULID},
 	}))
+	require.NoError(t, db.updateCachedShippedBlocks())
 
 	// Add more samples that could trigger another compaction and hence reload of blocks.
 	for j := int64(5); j < 6; j++ {
@@ -2534,11 +2732,18 @@ func TestIngesterNotDeleteUnshippedBlocks(t *testing.T) {
 	require.Equal(t, oldBlocks[2].Meta().ULID, newBlocks[1].Meta().ULID)    // 3rd block becomes 2nd now.
 	require.NotEqual(t, oldBlocks[1].Meta().ULID, newBlocks[2].Meta().ULID) // The new block won't match previous 2nd block.
 
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+		# HELP cortex_ingester_oldest_unshipped_block_timestamp_seconds Unix timestamp of the oldest TSDB block not shipped to the storage yet. 0 if ingester has no blocks or all blocks have been shipped.
+		# TYPE cortex_ingester_oldest_unshipped_block_timestamp_seconds gauge
+		cortex_ingester_oldest_unshipped_block_timestamp_seconds %d
+	`, newBlocks[0].Meta().ULID.Time()/1000)), "cortex_ingester_oldest_unshipped_block_timestamp_seconds"))
+
 	// Shipping 2 more blocks, hence all the blocks from first round.
 	require.Nil(t, shipper.WriteMetaFile(nil, db.db.Dir(), &shipper.Meta{
 		Version:  shipper.MetaVersion1,
 		Uploaded: []ulid.ULID{oldBlocks[1].Meta().ULID, newBlocks[0].Meta().ULID, newBlocks[1].Meta().ULID},
 	}))
+	require.NoError(t, db.updateCachedShippedBlocks())
 
 	// Add more samples that could trigger another compaction and hence reload of blocks.
 	for j := int64(6); j < 7; j++ {
@@ -2557,12 +2762,17 @@ func TestIngesterNotDeleteUnshippedBlocks(t *testing.T) {
 		// Second block is not one among old blocks.
 		require.NotEqual(t, b.Meta().ULID, newBlocks2[1].Meta().ULID)
 	}
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
+		# HELP cortex_ingester_oldest_unshipped_block_timestamp_seconds Unix timestamp of the oldest TSDB block not shipped to the storage yet. 0 if ingester has no blocks or all blocks have been shipped.
+		# TYPE cortex_ingester_oldest_unshipped_block_timestamp_seconds gauge
+		cortex_ingester_oldest_unshipped_block_timestamp_seconds %d
+	`, newBlocks2[0].Meta().ULID.Time()/1000)), "cortex_ingester_oldest_unshipped_block_timestamp_seconds"))
 }
 
 func TestIngesterPushErrorDuringForcedCompaction(t *testing.T) {
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), nil)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), nil)
 	require.NoError(t, err)
-	t.Cleanup(cleanup)
 
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	t.Cleanup(func() {
@@ -2575,7 +2785,7 @@ func TestIngesterPushErrorDuringForcedCompaction(t *testing.T) {
 	})
 
 	// Push a sample, it should succeed.
-	pushSingleSample(t, i)
+	pushSingleSampleWithMetadata(t, i)
 
 	// We mock a flushing by setting the boolean.
 	db := i.getTSDB(userID)
@@ -2590,14 +2800,13 @@ func TestIngesterPushErrorDuringForcedCompaction(t *testing.T) {
 
 	// Ingestion is successful after a flush.
 	require.True(t, db.casState(forceCompacting, active))
-	pushSingleSample(t, i)
+	pushSingleSampleWithMetadata(t, i)
 }
 
 func TestIngesterNoFlushWithInFlightRequest(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	i, cleanup, err := newIngesterMockWithTSDBStorage(defaultIngesterTestConfig(), registry)
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(), registry)
 	require.NoError(t, err)
-	t.Cleanup(cleanup)
 
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 	t.Cleanup(func() {
@@ -2611,7 +2820,7 @@ func TestIngesterNoFlushWithInFlightRequest(t *testing.T) {
 
 	// Push few samples.
 	for j := 0; j < 5; j++ {
-		pushSingleSample(t, i)
+		pushSingleSampleWithMetadata(t, i)
 	}
 
 	// Verifying that compaction won't happen when a request is in flight.

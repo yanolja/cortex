@@ -71,7 +71,9 @@ endef
 $(foreach exe, $(EXES), $(eval $(call dep_exe, $(exe))))
 
 # Manually declared dependencies And what goes into each exe
-pkg/ingester/client/cortex.pb.go: pkg/ingester/client/cortex.proto
+pkg/cortexpb/cortex.pb.go: pkg/cortexpb/cortex.proto
+pkg/ingester/client/ingester.pb.go: pkg/ingester/client/ingester.proto
+pkg/distributor/distributorpb/distributor.pb.go: pkg/distributor/distributorpb/distributor.proto
 pkg/ingester/wal.pb.go: pkg/ingester/wal.proto
 pkg/ring/ring.pb.go: pkg/ring/ring.proto
 pkg/frontend/v1/frontendv1pb/frontend.pb.go: pkg/frontend/v1/frontendv1pb/frontend.proto
@@ -87,6 +89,7 @@ pkg/scheduler/schedulerpb/scheduler.pb.go: pkg/scheduler/schedulerpb/scheduler.p
 pkg/storegateway/storegatewaypb/gateway.pb.go: pkg/storegateway/storegatewaypb/gateway.proto
 pkg/chunk/grpc/grpc.pb.go: pkg/chunk/grpc/grpc.proto
 tools/blocksconvert/scheduler.pb.go: tools/blocksconvert/scheduler.proto
+pkg/alertmanager/alertmanagerpb/alertmanager.pb.go: pkg/alertmanager/alertmanagerpb/alertmanager.proto
 
 all: $(UPTODATE_FILES)
 test: protos
@@ -158,7 +161,8 @@ lint:
 	GOFLAGS="-tags=requires_docker" faillint -paths "github.com/bmizerany/assert=github.com/stretchr/testify/assert,\
 		golang.org/x/net/context=context,\
 		sync/atomic=go.uber.org/atomic,\
-		github.com/weaveworks/common/user.{ExtractOrgID}=github.com/cortexproject/cortex/pkg/tenant.{TenantID},\
+		github.com/prometheus/client_golang/prometheus.{MultiError}=github.com/prometheus/prometheus/tsdb/errors.{NewMulti},\
+		github.com/weaveworks/common/user.{ExtractOrgID}=github.com/cortexproject/cortex/pkg/tenant.{TenantID,TenantIDs},\
 		github.com/weaveworks/common/user.{ExtractOrgIDFromHTTPRequest}=github.com/cortexproject/cortex/pkg/tenant.{ExtractTenantIDFromHTTPRequest}" ./pkg/... ./cmd/... ./tools/... ./integration/...
 
 	# Ensure clean pkg structure.
@@ -171,6 +175,18 @@ lint:
 		./pkg/querier/...
 	faillint -paths "github.com/cortexproject/cortex/pkg/querier/..." ./pkg/scheduler/...
 	faillint -paths "github.com/cortexproject/cortex/pkg/storage/tsdb/..." ./pkg/storage/bucket/...
+
+	# Ensure the query path is supporting multiple tenants
+	faillint -paths "\
+		github.com/cortexproject/cortex/pkg/tenant.{TenantID}=github.com/cortexproject/cortex/pkg/tenant.{TenantIDs}" \
+		./pkg/scheduler/... \
+		./pkg/frontend/... \
+		./pkg/querier/tenantfederation/... \
+		./pkg/querier/queryrange/...
+	# Ensure packages that no longer use a global logger don't reintroduce it
+	faillint -paths "github.com/cortexproject/cortex/pkg/util/log.{Logger}" \
+		./pkg/ingester/... \
+		./pkg/flusher/...
 
 	# Validate Kubernetes spec files. Requires:
 	# https://kubeval.instrumenta.dev
@@ -213,6 +229,7 @@ doc: clean-doc
 	go run ./tools/doc-generator ./docs/blocks-storage/querier.template              > ./docs/blocks-storage/querier.md
 	embedmd -w docs/operations/requests-mirroring-to-secondary-cluster.md
 	embedmd -w docs/configuration/single-process-config.md
+	embedmd -w docs/guides/overrides-exporter.md
 
 endif
 
@@ -257,7 +274,7 @@ check-white-noise: clean-white-noise
 	@git diff --exit-code --quiet -- '*.md' || (echo "Please remove trailing whitespaces running 'make clean-white-noise'" && false)
 
 web-serve:
-	cd website && hugo --config config.toml -v server
+	cd website && hugo --config config.toml --minify -v server
 
 # Generate binaries for a Cortex release
 dist dist/cortex-linux-amd64 dist/cortex-darwin-amd64 dist/query-tee-linux-amd64 dist/query-tee-darwin-amd64 dist/cortex-linux-amd64-sha-256 dist/cortex-darwin-amd64-sha-256 dist/query-tee-linux-amd64-sha-256 dist/query-tee-darwin-amd64-sha-256:

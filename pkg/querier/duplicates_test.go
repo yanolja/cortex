@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 func TestDuplicatesSamples(t *testing.T) {
@@ -88,7 +88,7 @@ func runPromQLAndGetJSONResult(t *testing.T, query string, ts client.TimeSeries,
 	tq := &testQueryable{ts: newTimeSeriesSeriesSet([]client.TimeSeries{ts})}
 
 	engine := promql.NewEngine(promql.EngineOpts{
-		Logger:     util.Logger,
+		Logger:     util_log.Logger,
 		Timeout:    10 * time.Second,
 		MaxSamples: 1e6,
 	})
@@ -124,7 +124,7 @@ func (m testQuerier) Select(_ bool, _ *storage.SelectHints, _ ...*labels.Matcher
 	return m.ts
 }
 
-func (m testQuerier) LabelValues(name string) ([]string, storage.Warnings, error) {
+func (m testQuerier) LabelValues(name string, matchers ...*labels.Matcher) ([]string, storage.Warnings, error) {
 	return nil, nil, nil
 }
 

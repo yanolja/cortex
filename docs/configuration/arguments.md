@@ -286,7 +286,7 @@ Multi KV also reacts on changes done via runtime configuration. It uses this sec
 
 ```yaml
 multi_kv_config:
-    mirror-enabled: false
+    mirror_enabled: false
     primary: memberlist
 ```
 
@@ -385,21 +385,6 @@ It also talks to a KVStore and has it's own copies of the same flags used by the
    Where you don't want to cache every chunk written by ingesters, but you do want to take advantage of chunk write deduplication, this option will make ingesters write a placeholder to the cache for each chunk.
    Make sure you configure ingesters with a different cache to queriers, which need the whole value.
 
-#### WAL
-
-- `-ingester.wal-dir`
-   Directory where the WAL data should be stored and/or recovered from.
-
-- `-ingester.wal-enabled`
-
-   Setting this to `true` enables writing to WAL during ingestion.
-
-- `-ingester.checkpoint-duration`
-   This is the interval at which checkpoints should be created.
-
-- `-ingester.recover-from-wal`
-   Set this to `true` to recover data from an existing WAL. The data is recovered even if WAL is disabled and this is set to `true`. The WAL dir needs to be set for this.
-
 #### Flusher
 
 - `-flusher.wal-dir`
@@ -431,11 +416,13 @@ overrides:
     max_series_per_query: 100000
 
 multi_kv_config:
-    mirror-enabled: false
+    mirror_enabled: false
     primary: memberlist
 ```
 
 When running Cortex on Kubernetes, store this file in a config map and mount it in each services' containers.  When changing the values there is no need to restart the services, unless otherwise specified.
+
+The `/runtime_config` endpoint returns the whole runtime configuration, including the overrides. In case you want to get only the non-default values of the configuration you can pass the `mode` parameter with the `diff` value.
 
 ## Ingester, Distributor & Querier limits.
 
@@ -536,6 +523,8 @@ The DNS service discovery, inspired from Thanos DNS SD, supports different disco
   The domain name after the prefix is looked up as a SRV query, and then each SRV record is resolved as an A/AAAA record. For example: `dnssrv+_memcached._tcp.memcached.namespace.svc.cluster.local`
 - **`dnssrvnoa+`**<br />
   The domain name after the prefix is looked up as a SRV query, with no A/AAAA lookup made after that. For example: `dnssrvnoa+_memcached._tcp.memcached.namespace.svc.cluster.local`
+
+If **no prefix** is provided, the provided IP or hostname will be used straightaway without pre-resolving it.
 
 ## Logging of IP of reverse proxy
 

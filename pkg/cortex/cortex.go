@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strings"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -31,6 +32,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/configs"
 	configAPI "github.com/cortexproject/cortex/pkg/configs/api"
 	"github.com/cortexproject/cortex/pkg/configs/db"
+	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/distributor"
 	"github.com/cortexproject/cortex/pkg/flusher"
 	"github.com/cortexproject/cortex/pkg/frontend"
@@ -39,6 +41,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/querier"
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
+	"github.com/cortexproject/cortex/pkg/querier/tenantfederation"
 	querier_worker "github.com/cortexproject/cortex/pkg/querier/worker"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
@@ -47,15 +50,21 @@ import (
 	"github.com/cortexproject/cortex/pkg/scheduler"
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/storegateway"
+	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/fakeauth"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/grpc/healthcheck"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/modules"
 	"github.com/cortexproject/cortex/pkg/util/process"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/validation"
+)
+
+var (
+	errInvalidHTTPPrefix = errors.New("HTTP prefix should be empty or start with /")
 )
 
 // The design pattern for Cortex is a series of config objects, which are
@@ -82,27 +91,28 @@ type Config struct {
 	PrintConfig bool                   `yaml:"-"`
 	HTTPPrefix  string                 `yaml:"http_prefix"`
 
-	API            api.Config                      `yaml:"api"`
-	Server         server.Config                   `yaml:"server"`
-	Distributor    distributor.Config              `yaml:"distributor"`
-	Querier        querier.Config                  `yaml:"querier"`
-	IngesterClient client.Config                   `yaml:"ingester_client"`
-	Ingester       ingester.Config                 `yaml:"ingester"`
-	Flusher        flusher.Config                  `yaml:"flusher"`
-	Storage        storage.Config                  `yaml:"storage"`
-	ChunkStore     chunk.StoreConfig               `yaml:"chunk_store"`
-	Schema         chunk.SchemaConfig              `yaml:"schema" doc:"hidden"` // Doc generation tool doesn't support it because part of the SchemaConfig doesn't support CLI flags (needs manual documentation)
-	LimitsConfig   validation.Limits               `yaml:"limits"`
-	Prealloc       client.PreallocConfig           `yaml:"prealloc" doc:"hidden"`
-	Worker         querier_worker.Config           `yaml:"frontend_worker"`
-	Frontend       frontend.CombinedFrontendConfig `yaml:"frontend"`
-	QueryRange     queryrange.Config               `yaml:"query_range"`
-	TableManager   chunk.TableManagerConfig        `yaml:"table_manager"`
-	Encoding       encoding.Config                 `yaml:"-"` // No yaml for this, it only works with flags.
-	BlocksStorage  tsdb.BlocksStorageConfig        `yaml:"blocks_storage"`
-	Compactor      compactor.Config                `yaml:"compactor"`
-	StoreGateway   storegateway.Config             `yaml:"store_gateway"`
-	PurgerConfig   purger.Config                   `yaml:"purger"`
+	API              api.Config                      `yaml:"api"`
+	Server           server.Config                   `yaml:"server"`
+	Distributor      distributor.Config              `yaml:"distributor"`
+	Querier          querier.Config                  `yaml:"querier"`
+	IngesterClient   client.Config                   `yaml:"ingester_client"`
+	Ingester         ingester.Config                 `yaml:"ingester"`
+	Flusher          flusher.Config                  `yaml:"flusher"`
+	Storage          storage.Config                  `yaml:"storage"`
+	ChunkStore       chunk.StoreConfig               `yaml:"chunk_store"`
+	Schema           chunk.SchemaConfig              `yaml:"schema" doc:"hidden"` // Doc generation tool doesn't support it because part of the SchemaConfig doesn't support CLI flags (needs manual documentation)
+	LimitsConfig     validation.Limits               `yaml:"limits"`
+	Prealloc         cortexpb.PreallocConfig         `yaml:"prealloc" doc:"hidden"`
+	Worker           querier_worker.Config           `yaml:"frontend_worker"`
+	Frontend         frontend.CombinedFrontendConfig `yaml:"frontend"`
+	QueryRange       queryrange.Config               `yaml:"query_range"`
+	TableManager     chunk.TableManagerConfig        `yaml:"table_manager"`
+	Encoding         encoding.Config                 `yaml:"-"` // No yaml for this, it only works with flags.
+	BlocksStorage    tsdb.BlocksStorageConfig        `yaml:"blocks_storage"`
+	Compactor        compactor.Config                `yaml:"compactor"`
+	StoreGateway     storegateway.Config             `yaml:"store_gateway"`
+	PurgerConfig     purger.Config                   `yaml:"purger"`
+	TenantFederation tenantfederation.Config         `yaml:"tenant_federation"`
 
 	Ruler          ruler.Config                               `yaml:"ruler"`
 	Configs        configs.Config                             `yaml:"configs"`
@@ -149,6 +159,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.Compactor.RegisterFlags(f)
 	c.StoreGateway.RegisterFlags(f)
 	c.PurgerConfig.RegisterFlags(f)
+	c.TenantFederation.RegisterFlags(f)
 
 	c.Ruler.RegisterFlags(f)
 	c.Configs.RegisterFlags(f)
@@ -166,6 +177,10 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 func (c *Config) Validate(log log.Logger) error {
 	if err := c.validateYAMLEmptyNodes(); err != nil {
 		return err
+	}
+
+	if c.HTTPPrefix != "" && !strings.HasPrefix(c.HTTPPrefix, "/") {
+		return errInvalidHTTPPrefix
 	}
 
 	if err := c.Schema.Validate(); err != nil {
@@ -201,7 +216,7 @@ func (c *Config) Validate(log log.Logger) error {
 	if err := c.Worker.Validate(log); err != nil {
 		return errors.Wrap(err, "invalid frontend_worker config")
 	}
-	if err := c.QueryRange.Validate(log); err != nil {
+	if err := c.QueryRange.Validate(); err != nil {
 		return errors.Wrap(err, "invalid query_range config")
 	}
 	if err := c.TableManager.Validate(); err != nil {
@@ -304,6 +319,12 @@ func New(cfg Config) (*Cortex, error) {
 		os.Exit(0)
 	}
 
+	// Swap out the default resolver to support multiple tenant IDs separated by a '|'
+	if cfg.TenantFederation.Enabled {
+		util_log.WarnExperimentalUse("tenant-federation")
+		tenant.WithDefaultResolver(tenant.NewMultiResolver())
+	}
+
 	// Don't check auth header on TransferChunks, as we weren't originally
 	// sending it and this could cause transfers to fail on update.
 	cfg.API.HTTPAuthMiddleware = fakeauth.SetupAuthMiddleware(&cfg.Server, cfg.AuthEnabled,
@@ -342,12 +363,12 @@ func (t *Cortex) Run() error {
 	if c, err := process.NewProcessCollector(); err == nil {
 		prometheus.MustRegister(c)
 	} else {
-		level.Warn(util.Logger).Log("msg", "skipped registration of custom process metrics collector", "err", err)
+		level.Warn(util_log.Logger).Log("msg", "skipped registration of custom process metrics collector", "err", err)
 	}
 
 	for _, module := range t.Cfg.Target {
 		if !t.ModuleManager.IsUserVisibleModule(module) {
-			level.Warn(util.Logger).Log("msg", "selected target is an internal module, is this intended?", "target", module)
+			level.Warn(util_log.Logger).Log("msg", "selected target is an internal module, is this intended?", "target", module)
 		}
 	}
 
@@ -376,8 +397,8 @@ func (t *Cortex) Run() error {
 	grpc_health_v1.RegisterHealthServer(t.Server.GRPC, healthcheck.New(sm))
 
 	// Let's listen for events from this manager, and log them.
-	healthy := func() { level.Info(util.Logger).Log("msg", "Cortex started") }
-	stopped := func() { level.Info(util.Logger).Log("msg", "Cortex stopped") }
+	healthy := func() { level.Info(util_log.Logger).Log("msg", "Cortex started") }
+	stopped := func() { level.Info(util_log.Logger).Log("msg", "Cortex stopped") }
 	serviceFailed := func(service services.Service) {
 		// if any service fails, stop entire Cortex
 		sm.StopAsync()
@@ -386,15 +407,15 @@ func (t *Cortex) Run() error {
 		for m, s := range t.ServiceMap {
 			if s == service {
 				if service.FailureCase() == util.ErrStopProcess {
-					level.Info(util.Logger).Log("msg", "received stop signal via return error", "module", m, "err", service.FailureCase())
+					level.Info(util_log.Logger).Log("msg", "received stop signal via return error", "module", m, "err", service.FailureCase())
 				} else {
-					level.Error(util.Logger).Log("msg", "module failed", "module", m, "err", service.FailureCase())
+					level.Error(util_log.Logger).Log("msg", "module failed", "module", m, "err", service.FailureCase())
 				}
 				return
 			}
 		}
 
-		level.Error(util.Logger).Log("msg", "module failed", "module", "unknown", "err", service.FailureCase())
+		level.Error(util_log.Logger).Log("msg", "module failed", "module", "unknown", "err", service.FailureCase())
 	}
 
 	sm.AddListener(services.NewManagerListener(healthy, stopped, serviceFailed))
@@ -465,6 +486,6 @@ func (t *Cortex) readyHandler(sm *services.Manager) http.HandlerFunc {
 			}
 		}
 
-		http.Error(w, "ready", http.StatusOK)
+		util.WriteTextResponse(w, "ready")
 	}
 }

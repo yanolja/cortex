@@ -143,6 +143,13 @@ api:
 # The purger_config configures the purger which takes care of delete requests
 [purger: <purger_config>]
 
+tenant_federation:
+  # If enabled on all Cortex services, queries can be federated across multiple
+  # tenants. The tenant IDs involved need to be specified separated by a `|`
+  # character in the `X-Scope-OrgID` header (experimental).
+  # CLI flag: -tenant-federation.enabled
+  [enabled: <boolean> | default = false]
+
 # The ruler_config configures the Cortex ruler.
 [ruler: <ruler_config>]
 
@@ -182,11 +189,6 @@ query_scheduler:
     # CLI flag: -query-scheduler.grpc-client-config.grpc-max-send-msg-size
     [max_send_msg_size: <int> | default = 16777216]
 
-    # Deprecated: Use gzip compression when sending messages.  If true,
-    # overrides grpc-compression flag.
-    # CLI flag: -query-scheduler.grpc-client-config.grpc-use-gzip-compression
-    [use_gzip_compression: <boolean> | default = false]
-
     # Use compression when sending messages. Supported values are: 'gzip',
     # 'snappy' and '' (disable compression)
     # CLI flag: -query-scheduler.grpc-client-config.grpc-compression
@@ -217,6 +219,12 @@ query_scheduler:
       # CLI flag: -query-scheduler.grpc-client-config.backoff-retries
       [max_retries: <int> | default = 10]
 
+    # Enable TLS in the GRPC client. This flag needs to be enabled when any
+    # other TLS flag is set. If set to false, insecure connection to gRPC server
+    # will be used.
+    # CLI flag: -query-scheduler.grpc-client-config.tls-enabled
+    [tls_enabled: <boolean> | default = false]
+
     # Path to the client certificate file, which will be used for authenticating
     # with the server. Also requires the key path to be configured.
     # CLI flag: -query-scheduler.grpc-client-config.tls-cert-path
@@ -231,6 +239,10 @@ query_scheduler:
     # If not set, the host's root CA certificates are used.
     # CLI flag: -query-scheduler.grpc-client-config.tls-ca-path
     [tls_ca_path: <string> | default = ""]
+
+    # Override the expected name on the server certificate.
+    # CLI flag: -query-scheduler.grpc-client-config.tls-server-name
+    [tls_server_name: <string> | default = ""]
 
     # Skip validating server certificate.
     # CLI flag: -query-scheduler.grpc-client-config.tls-insecure-skip-verify
@@ -494,6 +506,13 @@ ha_tracker:
 # CLI flag: -distributor.shard-by-all-labels
 [shard_by_all_labels: <boolean> | default = false]
 
+# Try writing to an additional ingester in the presence of an ingester not in
+# the ACTIVE state. It is useful to disable this along with
+# -ingester.unregister-on-shutdown=false in order to not spread samples to extra
+# ingesters during rolling restarts with consistent naming.
+# CLI flag: -distributor.extend-writes
+[extend_writes: <boolean> | default = true]
+
 ring:
   kvstore:
     # Backend storage to use for the ring. Supported values are: consul, etcd,
@@ -549,6 +568,8 @@ ring:
 The `ingester_config` configures the Cortex ingester.
 
 ```yaml
+# Configures the Write-Ahead Log (WAL) for the Cortex chunks storage. This
+# config is ignored when running the Cortex blocks storage.
 walconfig:
   # Enable writing of ingested data into WAL.
   # CLI flag: -ingester.wal-enabled
@@ -624,13 +645,6 @@ lifecycler:
     # different availability zones.
     # CLI flag: -distributor.zone-awareness-enabled
     [zone_awareness_enabled: <boolean> | default = false]
-
-    # Try writing to an additional ingester in the presence of an ingester not
-    # in the ACTIVE state. It is useful to disable this along with
-    # -ingester.unregister-on-shutdown=false in order to not spread samples to
-    # extra ingesters during rolling restarts with consistent naming.
-    # CLI flag: -distributor.extend-writes
-    [extend_writes: <boolean> | default = true]
 
   # Number of tokens for each ingester.
   # CLI flag: -ingester.num-tokens
@@ -786,7 +800,11 @@ The `querier_config` configures the Cortex querier.
 # CLI flag: -querier.query-store-for-labels-enabled
 [query_store_for_labels_enabled: <boolean> | default = false]
 
-# The time after which a metric should only be queried from storage and not just
+# Enable the @ modifier in PromQL.
+# CLI flag: -querier.at-modifier-enabled
+[at_modifier_enabled: <boolean> | default = false]
+
+# The time after which a metric should be queried from storage and not just
 # ingesters. 0 means all queries are sent to store. When running the blocks
 # storage, if this option is enabled, the time range of the query sent to the
 # store will be manipulated to ensure the query end is not more recent than 'now
@@ -822,6 +840,10 @@ The `querier_config` configures the Cortex querier.
 [store_gateway_addresses: <string> | default = ""]
 
 store_gateway_client:
+  # Enable TLS for gRPC client connecting to store-gateway.
+  # CLI flag: -querier.store-gateway-client.tls-enabled
+  [tls_enabled: <boolean> | default = false]
+
   # Path to the client certificate file, which will be used for authenticating
   # with the server. Also requires the key path to be configured.
   # CLI flag: -querier.store-gateway-client.tls-cert-path
@@ -836,6 +858,10 @@ store_gateway_client:
   # not set, the host's root CA certificates are used.
   # CLI flag: -querier.store-gateway-client.tls-ca-path
   [tls_ca_path: <string> | default = ""]
+
+  # Override the expected name on the server certificate.
+  # CLI flag: -querier.store-gateway-client.tls-server-name
+  [tls_server_name: <string> | default = ""]
 
   # Skip validating server certificate.
   # CLI flag: -querier.store-gateway-client.tls-insecure-skip-verify
@@ -875,8 +901,7 @@ The `query_frontend_config` configures the Cortex query-frontend.
 [max_body_size: <int> | default = 10485760]
 
 # True to enable query statistics tracking. When enabled, a message with some
-# statistics is logged for every query. This configuration option must be set
-# both on query-frontend and querier.
+# statistics is logged for every query.
 # CLI flag: -frontend.query-stats-enabled
 [query_stats_enabled: <boolean> | default = false]
 
@@ -906,11 +931,6 @@ grpc_client_config:
   # gRPC client max send message size (bytes).
   # CLI flag: -frontend.grpc-client-config.grpc-max-send-msg-size
   [max_send_msg_size: <int> | default = 16777216]
-
-  # Deprecated: Use gzip compression when sending messages.  If true, overrides
-  # grpc-compression flag.
-  # CLI flag: -frontend.grpc-client-config.grpc-use-gzip-compression
-  [use_gzip_compression: <boolean> | default = false]
 
   # Use compression when sending messages. Supported values are: 'gzip',
   # 'snappy' and '' (disable compression)
@@ -942,6 +962,12 @@ grpc_client_config:
     # CLI flag: -frontend.grpc-client-config.backoff-retries
     [max_retries: <int> | default = 10]
 
+  # Enable TLS in the GRPC client. This flag needs to be enabled when any other
+  # TLS flag is set. If set to false, insecure connection to gRPC server will be
+  # used.
+  # CLI flag: -frontend.grpc-client-config.tls-enabled
+  [tls_enabled: <boolean> | default = false]
+
   # Path to the client certificate file, which will be used for authenticating
   # with the server. Also requires the key path to be configured.
   # CLI flag: -frontend.grpc-client-config.tls-cert-path
@@ -956,6 +982,10 @@ grpc_client_config:
   # not set, the host's root CA certificates are used.
   # CLI flag: -frontend.grpc-client-config.tls-ca-path
   [tls_ca_path: <string> | default = ""]
+
+  # Override the expected name on the server certificate.
+  # CLI flag: -frontend.grpc-client-config.tls-server-name
+  [tls_server_name: <string> | default = ""]
 
   # Skip validating server certificate.
   # CLI flag: -frontend.grpc-client-config.tls-insecure-skip-verify
@@ -988,10 +1018,6 @@ The `query_range_config` configures the query splitting and caching in the Corte
 # determines how cache keys are chosen when result caching is enabled
 # CLI flag: -querier.split-queries-by-interval
 [split_queries_by_interval: <duration> | default = 0s]
-
-# Deprecated: Split queries by day and execute in parallel.
-# CLI flag: -querier.split-queries-by-day
-[split_queries_by_day: <boolean> | default = false]
 
 # Mutate incoming queries to align their start and end with their step.
 # CLI flag: -querier.align-querier-with-step
@@ -1072,11 +1098,6 @@ ruler_client:
   # CLI flag: -ruler.client.grpc-max-send-msg-size
   [max_send_msg_size: <int> | default = 16777216]
 
-  # Deprecated: Use gzip compression when sending messages.  If true, overrides
-  # grpc-compression flag.
-  # CLI flag: -ruler.client.grpc-use-gzip-compression
-  [use_gzip_compression: <boolean> | default = false]
-
   # Use compression when sending messages. Supported values are: 'gzip',
   # 'snappy' and '' (disable compression)
   # CLI flag: -ruler.client.grpc-compression
@@ -1107,6 +1128,12 @@ ruler_client:
     # CLI flag: -ruler.client.backoff-retries
     [max_retries: <int> | default = 10]
 
+  # Enable TLS in the GRPC client. This flag needs to be enabled when any other
+  # TLS flag is set. If set to false, insecure connection to gRPC server will be
+  # used.
+  # CLI flag: -ruler.client.tls-enabled
+  [tls_enabled: <boolean> | default = false]
+
   # Path to the client certificate file, which will be used for authenticating
   # with the server. Also requires the key path to be configured.
   # CLI flag: -ruler.client.tls-cert-path
@@ -1122,6 +1149,10 @@ ruler_client:
   # CLI flag: -ruler.client.tls-ca-path
   [tls_ca_path: <string> | default = ""]
 
+  # Override the expected name on the server certificate.
+  # CLI flag: -ruler.client.tls-server-name
+  [tls_server_name: <string> | default = ""]
+
   # Skip validating server certificate.
   # CLI flag: -ruler.client.tls-insecure-skip-verify
   [tls_insecure_skip_verify: <boolean> | default = false]
@@ -1129,10 +1160,6 @@ ruler_client:
 # How frequently to evaluate rules
 # CLI flag: -ruler.evaluation-interval
 [evaluation_interval: <duration> | default = 1m]
-
-# Deprecated. Please use -ruler.evaluation-delay-duration instead.
-# CLI flag: -ruler.evaluation-delay-duration-deprecated
-[evaluation_delay_duration: <duration> | default = 0s]
 
 # How frequently to poll for rule changes
 # CLI flag: -ruler.poll-interval
@@ -1248,7 +1275,8 @@ storage:
     # CLI flag: -ruler.storage.s3.insecure
     [insecure: <boolean> | default = false]
 
-    # Enable AES256 AWS Server Side Encryption
+    # Enable AWS Server Side Encryption [Deprecated: Use .sse instead. if
+    # s3.sse-encryption is enabled, it assumes .sse.type SSE-S3]
     # CLI flag: -ruler.storage.s3.sse-encryption
     [sse_encryption: <boolean> | default = false]
 
@@ -1271,65 +1299,96 @@ storage:
     # CLI flag: -ruler.storage.s3.signature-version
     [signature_version: <string> | default = "v4"]
 
+    sse:
+      # Enable AWS Server Side Encryption. Only SSE-S3 and SSE-KMS are supported
+      # CLI flag: -ruler.storage.s3.sse.type
+      [type: <string> | default = ""]
+
+      # KMS Key ID used to encrypt objects in S3
+      # CLI flag: -ruler.storage.s3.sse.kms-key-id
+      [kms_key_id: <string> | default = ""]
+
+      # KMS Encryption Context used for object encryption. It expects JSON
+      # formatted string.
+      # CLI flag: -ruler.storage.s3.sse.kms-encryption-context
+      [kms_encryption_context: <string> | default = ""]
+
   swift:
-    # Openstack authentication URL.
+    # OpenStack Swift authentication API version. 0 to autodetect.
+    # CLI flag: -ruler.storage.swift.auth-version
+    [auth_version: <int> | default = 0]
+
+    # OpenStack Swift authentication URL
     # CLI flag: -ruler.storage.swift.auth-url
     [auth_url: <string> | default = ""]
 
-    # Openstack username for the api.
+    # OpenStack Swift username.
     # CLI flag: -ruler.storage.swift.username
     [username: <string> | default = ""]
 
-    # Openstack user's domain name.
+    # OpenStack Swift user's domain name.
     # CLI flag: -ruler.storage.swift.user-domain-name
     [user_domain_name: <string> | default = ""]
 
-    # Openstack user's domain id.
+    # OpenStack Swift user's domain ID.
     # CLI flag: -ruler.storage.swift.user-domain-id
     [user_domain_id: <string> | default = ""]
 
-    # Openstack userid for the api.
+    # OpenStack Swift user ID.
     # CLI flag: -ruler.storage.swift.user-id
     [user_id: <string> | default = ""]
 
-    # Openstack api key.
+    # OpenStack Swift API key.
     # CLI flag: -ruler.storage.swift.password
     [password: <string> | default = ""]
 
-    # Openstack user's domain id.
+    # OpenStack Swift user's domain ID.
     # CLI flag: -ruler.storage.swift.domain-id
     [domain_id: <string> | default = ""]
 
-    # Openstack user's domain name.
+    # OpenStack Swift user's domain name.
     # CLI flag: -ruler.storage.swift.domain-name
     [domain_name: <string> | default = ""]
 
-    # Openstack project id (v2,v3 auth only).
+    # OpenStack Swift project ID (v2,v3 auth only).
     # CLI flag: -ruler.storage.swift.project-id
     [project_id: <string> | default = ""]
 
-    # Openstack project name (v2,v3 auth only).
+    # OpenStack Swift project name (v2,v3 auth only).
     # CLI flag: -ruler.storage.swift.project-name
     [project_name: <string> | default = ""]
 
-    # Id of the project's domain (v3 auth only), only needed if it differs the
-    # from user domain.
+    # ID of the OpenStack Swift project's domain (v3 auth only), only needed if
+    # it differs the from user domain.
     # CLI flag: -ruler.storage.swift.project-domain-id
     [project_domain_id: <string> | default = ""]
 
-    # Name of the project's domain (v3 auth only), only needed if it differs
-    # from the user domain.
+    # Name of the OpenStack Swift project's domain (v3 auth only), only needed
+    # if it differs from the user domain.
     # CLI flag: -ruler.storage.swift.project-domain-name
     [project_domain_name: <string> | default = ""]
 
-    # Openstack Region to use eg LON, ORD - default is use first region (v2,v3
-    # auth only)
+    # OpenStack Swift Region to use (v2,v3 auth only).
     # CLI flag: -ruler.storage.swift.region-name
     [region_name: <string> | default = ""]
 
-    # Name of the Swift container to put chunks in.
+    # Name of the OpenStack Swift container to put chunks in.
     # CLI flag: -ruler.storage.swift.container-name
-    [container_name: <string> | default = "cortex"]
+    [container_name: <string> | default = ""]
+
+    # Max retries on requests error.
+    # CLI flag: -ruler.storage.swift.max-retries
+    [max_retries: <int> | default = 3]
+
+    # Time after which a connection attempt is aborted.
+    # CLI flag: -ruler.storage.swift.connect-timeout
+    [connect_timeout: <duration> | default = 10s]
+
+    # Time after which an idle request is aborted. The timeout watchdog is reset
+    # each time some data is received, so the timeout triggers after X time no
+    # data is received on a request.
+    # CLI flag: -ruler.storage.swift.request-timeout
+    [request_timeout: <duration> | default = 5s]
 
   local:
     # Directory to scan for rules
@@ -1366,6 +1425,40 @@ storage:
 # HTTP timeout duration when sending notifications to the Alertmanager.
 # CLI flag: -ruler.notification-timeout
 [notification_timeout: <duration> | default = 10s]
+
+alertmanager_client:
+  # Path to the client certificate file, which will be used for authenticating
+  # with the server. Also requires the key path to be configured.
+  # CLI flag: -ruler.alertmanager-client.tls-cert-path
+  [tls_cert_path: <string> | default = ""]
+
+  # Path to the key file for the client certificate. Also requires the client
+  # certificate to be configured.
+  # CLI flag: -ruler.alertmanager-client.tls-key-path
+  [tls_key_path: <string> | default = ""]
+
+  # Path to the CA certificates file to validate server certificate against. If
+  # not set, the host's root CA certificates are used.
+  # CLI flag: -ruler.alertmanager-client.tls-ca-path
+  [tls_ca_path: <string> | default = ""]
+
+  # Override the expected name on the server certificate.
+  # CLI flag: -ruler.alertmanager-client.tls-server-name
+  [tls_server_name: <string> | default = ""]
+
+  # Skip validating server certificate.
+  # CLI flag: -ruler.alertmanager-client.tls-insecure-skip-verify
+  [tls_insecure_skip_verify: <boolean> | default = false]
+
+  # HTTP Basic authentication username. It overrides the username set in the URL
+  # (if any).
+  # CLI flag: -ruler.alertmanager-client.basic-auth-username
+  [basic_auth_username: <string> | default = ""]
+
+  # HTTP Basic authentication password. It overrides the password set in the URL
+  # (if any).
+  # CLI flag: -ruler.alertmanager-client.basic-auth-password
+  [basic_auth_password: <string> | default = ""]
 
 # Max time to tolerate outage for restoring "for" state of alert.
 # CLI flag: -ruler.for-outage-tolerance
@@ -1441,7 +1534,7 @@ ring:
   # CLI flag: -ruler.ring.instance-interface-names
   [instance_interface_names: <list of string> | default = [eth0 en0]]
 
-  # Number of tokens for each ingester.
+  # Number of tokens for each ruler.
   # CLI flag: -ruler.ring.num-tokens
   [num_tokens: <int> | default = 128]
 
@@ -1479,21 +1572,83 @@ The `alertmanager_config` configures the Cortex alertmanager.
 # CLI flag: -alertmanager.configs.poll-interval
 [poll_interval: <duration> | default = 15s]
 
-# Listen address for cluster.
+# Maximum size (bytes) of an accepted HTTP request body.
+# CLI flag: -alertmanager.max-recv-msg-size
+[max_recv_msg_size: <int> | default = 16777216]
+
+# Deprecated. Use -alertmanager.cluster.listen-address instead.
 # CLI flag: -cluster.listen-address
 [cluster_bind_address: <string> | default = "0.0.0.0:9094"]
 
-# Explicit address to advertise in cluster.
+# Deprecated. Use -alertmanager.cluster.advertise-address instead.
 # CLI flag: -cluster.advertise-address
 [cluster_advertise_address: <string> | default = ""]
 
-# Initial peers (may be repeated).
+# Deprecated. Use -alertmanager.cluster.peers instead.
 # CLI flag: -cluster.peer
 [peers: <list of string> | default = []]
 
-# Time to wait between peers to send notifications.
+# Deprecated. Use -alertmanager.cluster.peer-timeout instead.
 # CLI flag: -cluster.peer-timeout
 [peer_timeout: <duration> | default = 15s]
+
+# Shard tenants across multiple alertmanager instances.
+# CLI flag: -alertmanager.sharding-enabled
+[sharding_enabled: <boolean> | default = false]
+
+sharding_ring:
+  # The key-value store used to share the hash ring across multiple instances.
+  kvstore:
+    # Backend storage to use for the ring. Supported values are: consul, etcd,
+    # inmemory, memberlist, multi.
+    # CLI flag: -alertmanager.sharding-ring.store
+    [store: <string> | default = "consul"]
+
+    # The prefix for the keys in the store. Should end with a /.
+    # CLI flag: -alertmanager.sharding-ring.prefix
+    [prefix: <string> | default = "alertmanagers/"]
+
+    # The consul_config configures the consul client.
+    # The CLI flags prefix for this block config is: alertmanager.sharding-ring
+    [consul: <consul_config>]
+
+    # The etcd_config configures the etcd client.
+    # The CLI flags prefix for this block config is: alertmanager.sharding-ring
+    [etcd: <etcd_config>]
+
+    multi:
+      # Primary backend storage used by multi-client.
+      # CLI flag: -alertmanager.sharding-ring.multi.primary
+      [primary: <string> | default = ""]
+
+      # Secondary backend storage used by multi-client.
+      # CLI flag: -alertmanager.sharding-ring.multi.secondary
+      [secondary: <string> | default = ""]
+
+      # Mirror writes to secondary store.
+      # CLI flag: -alertmanager.sharding-ring.multi.mirror-enabled
+      [mirror_enabled: <boolean> | default = false]
+
+      # Timeout for storing value to secondary store.
+      # CLI flag: -alertmanager.sharding-ring.multi.mirror-timeout
+      [mirror_timeout: <duration> | default = 2s]
+
+  # Period at which to heartbeat to the ring.
+  # CLI flag: -alertmanager.sharding-ring.heartbeat-period
+  [heartbeat_period: <duration> | default = 15s]
+
+  # The heartbeat timeout after which alertmanagers are considered unhealthy
+  # within the ring.
+  # CLI flag: -alertmanager.sharding-ring.heartbeat-timeout
+  [heartbeat_timeout: <duration> | default = 1m]
+
+  # The replication factor to use when sharding the alertmanager.
+  # CLI flag: -alertmanager.sharding-ring.replication-factor
+  [replication_factor: <int> | default = 3]
+
+  # Name of network interface to read address from.
+  # CLI flag: -alertmanager.sharding-ring.instance-interface-names
+  [instance_interface_names: <list of string> | default = [eth0 en0]]
 
 # Filename of fallback config to use if none specified for instance.
 # CLI flag: -alertmanager.configs.fallback
@@ -1514,10 +1669,52 @@ storage:
   # The CLI flags prefix for this block config is: alertmanager
   [configdb: <configstore_config>]
 
-  local:
-    # Path at which alertmanager configurations are stored.
-    # CLI flag: -alertmanager.storage.local.path
-    [path: <string> | default = ""]
+  azure:
+    # Azure Cloud environment. Supported values are: AzureGlobal,
+    # AzureChinaCloud, AzureGermanCloud, AzureUSGovernment.
+    # CLI flag: -alertmanager.storage.azure.environment
+    [environment: <string> | default = "AzureGlobal"]
+
+    # Name of the blob container used to store chunks. This container must be
+    # created before running cortex.
+    # CLI flag: -alertmanager.storage.azure.container-name
+    [container_name: <string> | default = "cortex"]
+
+    # The Microsoft Azure account name to be used
+    # CLI flag: -alertmanager.storage.azure.account-name
+    [account_name: <string> | default = ""]
+
+    # The Microsoft Azure account key to use.
+    # CLI flag: -alertmanager.storage.azure.account-key
+    [account_key: <string> | default = ""]
+
+    # Preallocated buffer size for downloads.
+    # CLI flag: -alertmanager.storage.azure.download-buffer-size
+    [download_buffer_size: <int> | default = 512000]
+
+    # Preallocated buffer size for uploads.
+    # CLI flag: -alertmanager.storage.azure.upload-buffer-size
+    [upload_buffer_size: <int> | default = 256000]
+
+    # Number of buffers used to used to upload a chunk.
+    # CLI flag: -alertmanager.storage.azure.download-buffer-count
+    [upload_buffer_count: <int> | default = 1]
+
+    # Timeout for requests made against azure blob storage.
+    # CLI flag: -alertmanager.storage.azure.request-timeout
+    [request_timeout: <duration> | default = 30s]
+
+    # Number of retries for a request which times out.
+    # CLI flag: -alertmanager.storage.azure.max-retries
+    [max_retries: <int> | default = 5]
+
+    # Minimum time to wait before retrying a request.
+    # CLI flag: -alertmanager.storage.azure.min-retry-delay
+    [min_retry_delay: <duration> | default = 10ms]
+
+    # Maximum time to wait before retrying a request.
+    # CLI flag: -alertmanager.storage.azure.max-retry-delay
+    [max_retry_delay: <duration> | default = 500ms]
 
   gcs:
     # Name of GCS bucket. Please refer to
@@ -1571,7 +1768,8 @@ storage:
     # CLI flag: -alertmanager.storage.s3.insecure
     [insecure: <boolean> | default = false]
 
-    # Enable AES256 AWS Server Side Encryption
+    # Enable AWS Server Side Encryption [Deprecated: Use .sse instead. if
+    # s3.sse-encryption is enabled, it assumes .sse.type SSE-S3]
     # CLI flag: -alertmanager.storage.s3.sse-encryption
     [sse_encryption: <boolean> | default = false]
 
@@ -1594,9 +1792,92 @@ storage:
     # CLI flag: -alertmanager.storage.s3.signature-version
     [signature_version: <string> | default = "v4"]
 
+    sse:
+      # Enable AWS Server Side Encryption. Only SSE-S3 and SSE-KMS are supported
+      # CLI flag: -alertmanager.storage.s3.sse.type
+      [type: <string> | default = ""]
+
+      # KMS Key ID used to encrypt objects in S3
+      # CLI flag: -alertmanager.storage.s3.sse.kms-key-id
+      [kms_key_id: <string> | default = ""]
+
+      # KMS Encryption Context used for object encryption. It expects JSON
+      # formatted string.
+      # CLI flag: -alertmanager.storage.s3.sse.kms-encryption-context
+      [kms_encryption_context: <string> | default = ""]
+
+  local:
+    # Path at which alertmanager configurations are stored.
+    # CLI flag: -alertmanager.storage.local.path
+    [path: <string> | default = ""]
+
+cluster:
+  # Listen address and port for the cluster. Not specifying this flag disables
+  # high-availability mode.
+  # CLI flag: -alertmanager.cluster.listen-address
+  [listen_address: <string> | default = "0.0.0.0:9094"]
+
+  # Explicit address or hostname to advertise in cluster.
+  # CLI flag: -alertmanager.cluster.advertise-address
+  [advertise_address: <string> | default = ""]
+
+  # Comma-separated list of initial peers.
+  # CLI flag: -alertmanager.cluster.peers
+  [peers: <string> | default = ""]
+
+  # Time to wait between peers to send notifications.
+  # CLI flag: -alertmanager.cluster.peer-timeout
+  [peer_timeout: <duration> | default = 15s]
+
+  # The interval between sending gossip messages. By lowering this value (more
+  # frequent) gossip messages are propagated across cluster more quickly at the
+  # expense of increased bandwidth usage.
+  # CLI flag: -alertmanager.cluster.gossip-interval
+  [gossip_interval: <duration> | default = 200ms]
+
+  # The interval between gossip state syncs. Setting this interval lower (more
+  # frequent) will increase convergence speeds across larger clusters at the
+  # expense of increased bandwidth usage.
+  # CLI flag: -alertmanager.cluster.push-pull-interval
+  [push_pull_interval: <duration> | default = 1m]
+
 # Enable the experimental alertmanager config api.
 # CLI flag: -experimental.alertmanager.enable-api
 [enable_api: <boolean> | default = false]
+
+alertmanager_client:
+  # Timeout for downstream alertmanagers.
+  # CLI flag: -alertmanager.alertmanager-client.remote-timeout
+  [remote_timeout: <duration> | default = 2s]
+
+  # Enable TLS in the GRPC client. This flag needs to be enabled when any other
+  # TLS flag is set. If set to false, insecure connection to gRPC server will be
+  # used.
+  # CLI flag: -alertmanager.alertmanager-client.tls-enabled
+  [tls_enabled: <boolean> | default = false]
+
+  # Path to the client certificate file, which will be used for authenticating
+  # with the server. Also requires the key path to be configured.
+  # CLI flag: -alertmanager.alertmanager-client.tls-cert-path
+  [tls_cert_path: <string> | default = ""]
+
+  # Path to the key file for the client certificate. Also requires the client
+  # certificate to be configured.
+  # CLI flag: -alertmanager.alertmanager-client.tls-key-path
+  [tls_key_path: <string> | default = ""]
+
+  # Path to the CA certificates file to validate server certificate against. If
+  # not set, the host's root CA certificates are used.
+  # CLI flag: -alertmanager.alertmanager-client.tls-ca-path
+  [tls_ca_path: <string> | default = ""]
+
+  # Override the expected name on the server certificate.
+  # CLI flag: -alertmanager.alertmanager-client.tls-server-name
+  [tls_server_name: <string> | default = ""]
+
+  # Skip validating server certificate.
+  # CLI flag: -alertmanager.alertmanager-client.tls-insecure-skip-verify
+  [tls_insecure_skip_verify: <boolean> | default = false]
 ```
 
 ### `table_manager_config`
@@ -2053,7 +2334,8 @@ aws:
   # CLI flag: -s3.insecure
   [insecure: <boolean> | default = false]
 
-  # Enable AES256 AWS Server Side Encryption
+  # Enable AWS Server Side Encryption [Deprecated: Use .sse instead. if
+  # s3.sse-encryption is enabled, it assumes .sse.type SSE-S3]
   # CLI flag: -s3.sse-encryption
   [sse_encryption: <boolean> | default = false]
 
@@ -2075,6 +2357,20 @@ aws:
   # are: v4, v2.
   # CLI flag: -s3.signature-version
   [signature_version: <string> | default = "v4"]
+
+  sse:
+    # Enable AWS Server Side Encryption. Only SSE-S3 and SSE-KMS are supported
+    # CLI flag: -s3.sse.type
+    [type: <string> | default = ""]
+
+    # KMS Key ID used to encrypt objects in S3
+    # CLI flag: -s3.sse.kms-key-id
+    [kms_key_id: <string> | default = ""]
+
+    # KMS Encryption Context used for object encryption. It expects JSON
+    # formatted string.
+    # CLI flag: -s3.sse.kms-encryption-context
+    [kms_encryption_context: <string> | default = ""]
 
 azure:
   # Azure Cloud environment. Supported values are: AzureGlobal, AzureChinaCloud,
@@ -2143,11 +2439,6 @@ bigtable:
     # CLI flag: -bigtable.grpc-max-send-msg-size
     [max_send_msg_size: <int> | default = 16777216]
 
-    # Deprecated: Use gzip compression when sending messages.  If true,
-    # overrides grpc-compression flag.
-    # CLI flag: -bigtable.grpc-use-gzip-compression
-    [use_gzip_compression: <boolean> | default = false]
-
     # Use compression when sending messages. Supported values are: 'gzip',
     # 'snappy' and '' (disable compression)
     # CLI flag: -bigtable.grpc-compression
@@ -2177,6 +2468,35 @@ bigtable:
       # Number of times to backoff and retry before failing.
       # CLI flag: -bigtable.backoff-retries
       [max_retries: <int> | default = 10]
+
+    # Enable TLS in the GRPC client. This flag needs to be enabled when any
+    # other TLS flag is set. If set to false, insecure connection to gRPC server
+    # will be used.
+    # CLI flag: -bigtable.tls-enabled
+    [tls_enabled: <boolean> | default = true]
+
+    # Path to the client certificate file, which will be used for authenticating
+    # with the server. Also requires the key path to be configured.
+    # CLI flag: -bigtable.tls-cert-path
+    [tls_cert_path: <string> | default = ""]
+
+    # Path to the key file for the client certificate. Also requires the client
+    # certificate to be configured.
+    # CLI flag: -bigtable.tls-key-path
+    [tls_key_path: <string> | default = ""]
+
+    # Path to the CA certificates file to validate server certificate against.
+    # If not set, the host's root CA certificates are used.
+    # CLI flag: -bigtable.tls-ca-path
+    [tls_ca_path: <string> | default = ""]
+
+    # Override the expected name on the server certificate.
+    # CLI flag: -bigtable.tls-server-name
+    [tls_server_name: <string> | default = ""]
+
+    # Skip validating server certificate.
+    # CLI flag: -bigtable.tls-insecure-skip-verify
+    [tls_insecure_skip_verify: <boolean> | default = false]
 
   # If enabled, once a tables info is fetched, it is cached.
   # CLI flag: -bigtable.table-cache.enabled
@@ -2325,64 +2645,81 @@ filesystem:
   [directory: <string> | default = ""]
 
 swift:
-  # Openstack authentication URL.
+  # OpenStack Swift authentication API version. 0 to autodetect.
+  # CLI flag: -swift.auth-version
+  [auth_version: <int> | default = 0]
+
+  # OpenStack Swift authentication URL
   # CLI flag: -swift.auth-url
   [auth_url: <string> | default = ""]
 
-  # Openstack username for the api.
+  # OpenStack Swift username.
   # CLI flag: -swift.username
   [username: <string> | default = ""]
 
-  # Openstack user's domain name.
+  # OpenStack Swift user's domain name.
   # CLI flag: -swift.user-domain-name
   [user_domain_name: <string> | default = ""]
 
-  # Openstack user's domain id.
+  # OpenStack Swift user's domain ID.
   # CLI flag: -swift.user-domain-id
   [user_domain_id: <string> | default = ""]
 
-  # Openstack userid for the api.
+  # OpenStack Swift user ID.
   # CLI flag: -swift.user-id
   [user_id: <string> | default = ""]
 
-  # Openstack api key.
+  # OpenStack Swift API key.
   # CLI flag: -swift.password
   [password: <string> | default = ""]
 
-  # Openstack user's domain id.
+  # OpenStack Swift user's domain ID.
   # CLI flag: -swift.domain-id
   [domain_id: <string> | default = ""]
 
-  # Openstack user's domain name.
+  # OpenStack Swift user's domain name.
   # CLI flag: -swift.domain-name
   [domain_name: <string> | default = ""]
 
-  # Openstack project id (v2,v3 auth only).
+  # OpenStack Swift project ID (v2,v3 auth only).
   # CLI flag: -swift.project-id
   [project_id: <string> | default = ""]
 
-  # Openstack project name (v2,v3 auth only).
+  # OpenStack Swift project name (v2,v3 auth only).
   # CLI flag: -swift.project-name
   [project_name: <string> | default = ""]
 
-  # Id of the project's domain (v3 auth only), only needed if it differs the
-  # from user domain.
+  # ID of the OpenStack Swift project's domain (v3 auth only), only needed if it
+  # differs the from user domain.
   # CLI flag: -swift.project-domain-id
   [project_domain_id: <string> | default = ""]
 
-  # Name of the project's domain (v3 auth only), only needed if it differs from
-  # the user domain.
+  # Name of the OpenStack Swift project's domain (v3 auth only), only needed if
+  # it differs from the user domain.
   # CLI flag: -swift.project-domain-name
   [project_domain_name: <string> | default = ""]
 
-  # Openstack Region to use eg LON, ORD - default is use first region (v2,v3
-  # auth only)
+  # OpenStack Swift Region to use (v2,v3 auth only).
   # CLI flag: -swift.region-name
   [region_name: <string> | default = ""]
 
-  # Name of the Swift container to put chunks in.
+  # Name of the OpenStack Swift container to put chunks in.
   # CLI flag: -swift.container-name
-  [container_name: <string> | default = "cortex"]
+  [container_name: <string> | default = ""]
+
+  # Max retries on requests error.
+  # CLI flag: -swift.max-retries
+  [max_retries: <int> | default = 3]
+
+  # Time after which a connection attempt is aborted.
+  # CLI flag: -swift.connect-timeout
+  [connect_timeout: <duration> | default = 10s]
+
+  # Time after which an idle request is aborted. The timeout watchdog is reset
+  # each time some data is received, so the timeout triggers after X time no
+  # data is received on a request.
+  # CLI flag: -swift.request-timeout
+  [request_timeout: <duration> | default = 5s]
 
 # Cache validity for active index entries. Should be no higher than
 # -ingester.max-chunk-idle.
@@ -2651,11 +2988,6 @@ grpc_client_config:
   # CLI flag: -ingester.client.grpc-max-send-msg-size
   [max_send_msg_size: <int> | default = 16777216]
 
-  # Deprecated: Use gzip compression when sending messages.  If true, overrides
-  # grpc-compression flag.
-  # CLI flag: -ingester.client.grpc-use-gzip-compression
-  [use_gzip_compression: <boolean> | default = false]
-
   # Use compression when sending messages. Supported values are: 'gzip',
   # 'snappy' and '' (disable compression)
   # CLI flag: -ingester.client.grpc-compression
@@ -2686,6 +3018,12 @@ grpc_client_config:
     # CLI flag: -ingester.client.backoff-retries
     [max_retries: <int> | default = 10]
 
+  # Enable TLS in the GRPC client. This flag needs to be enabled when any other
+  # TLS flag is set. If set to false, insecure connection to gRPC server will be
+  # used.
+  # CLI flag: -ingester.client.tls-enabled
+  [tls_enabled: <boolean> | default = false]
+
   # Path to the client certificate file, which will be used for authenticating
   # with the server. Also requires the key path to be configured.
   # CLI flag: -ingester.client.tls-cert-path
@@ -2700,6 +3038,10 @@ grpc_client_config:
   # not set, the host's root CA certificates are used.
   # CLI flag: -ingester.client.tls-ca-path
   [tls_ca_path: <string> | default = ""]
+
+  # Override the expected name on the server certificate.
+  # CLI flag: -ingester.client.tls-server-name
+  [tls_server_name: <string> | default = ""]
 
   # Skip validating server certificate.
   # CLI flag: -ingester.client.tls-insecure-skip-verify
@@ -2753,11 +3095,6 @@ grpc_client_config:
   # CLI flag: -querier.frontend-client.grpc-max-send-msg-size
   [max_send_msg_size: <int> | default = 16777216]
 
-  # Deprecated: Use gzip compression when sending messages.  If true, overrides
-  # grpc-compression flag.
-  # CLI flag: -querier.frontend-client.grpc-use-gzip-compression
-  [use_gzip_compression: <boolean> | default = false]
-
   # Use compression when sending messages. Supported values are: 'gzip',
   # 'snappy' and '' (disable compression)
   # CLI flag: -querier.frontend-client.grpc-compression
@@ -2788,6 +3125,12 @@ grpc_client_config:
     # CLI flag: -querier.frontend-client.backoff-retries
     [max_retries: <int> | default = 10]
 
+  # Enable TLS in the GRPC client. This flag needs to be enabled when any other
+  # TLS flag is set. If set to false, insecure connection to gRPC server will be
+  # used.
+  # CLI flag: -querier.frontend-client.tls-enabled
+  [tls_enabled: <boolean> | default = false]
+
   # Path to the client certificate file, which will be used for authenticating
   # with the server. Also requires the key path to be configured.
   # CLI flag: -querier.frontend-client.tls-cert-path
@@ -2803,6 +3146,10 @@ grpc_client_config:
   # CLI flag: -querier.frontend-client.tls-ca-path
   [tls_ca_path: <string> | default = ""]
 
+  # Override the expected name on the server certificate.
+  # CLI flag: -querier.frontend-client.tls-server-name
+  [tls_server_name: <string> | default = ""]
+
   # Skip validating server certificate.
   # CLI flag: -querier.frontend-client.tls-insecure-skip-verify
   [tls_insecure_skip_verify: <boolean> | default = false]
@@ -2813,6 +3160,7 @@ grpc_client_config:
 The `etcd_config` configures the etcd client. The supported CLI flags `<prefix>` used to reference this config block are:
 
 - _no prefix_
+- `alertmanager.sharding-ring`
 - `compactor.ring`
 - `distributor.ha-tracker`
 - `distributor.ring`
@@ -2838,17 +3186,24 @@ The `etcd_config` configures the etcd client. The supported CLI flags `<prefix>`
 # CLI flag: -<prefix>.etcd.tls-enabled
 [tls_enabled: <boolean> | default = false]
 
-# The TLS certificate file path.
+# Path to the client certificate file, which will be used for authenticating
+# with the server. Also requires the key path to be configured.
 # CLI flag: -<prefix>.etcd.tls-cert-path
 [tls_cert_path: <string> | default = ""]
 
-# The TLS private key file path.
+# Path to the key file for the client certificate. Also requires the client
+# certificate to be configured.
 # CLI flag: -<prefix>.etcd.tls-key-path
 [tls_key_path: <string> | default = ""]
 
-# The trusted CA file path.
+# Path to the CA certificates file to validate server certificate against. If
+# not set, the host's root CA certificates are used.
 # CLI flag: -<prefix>.etcd.tls-ca-path
 [tls_ca_path: <string> | default = ""]
+
+# Override the expected name on the server certificate.
+# CLI flag: -<prefix>.etcd.tls-server-name
+[tls_server_name: <string> | default = ""]
 
 # Skip validating server certificate.
 # CLI flag: -<prefix>.etcd.tls-insecure-skip-verify
@@ -2860,6 +3215,7 @@ The `etcd_config` configures the etcd client. The supported CLI flags `<prefix>`
 The `consul_config` configures the consul client. The supported CLI flags `<prefix>` used to reference this config block are:
 
 - _no prefix_
+- `alertmanager.sharding-ring`
 - `compactor.ring`
 - `distributor.ha-tracker`
 - `distributor.ring`
@@ -2979,6 +3335,11 @@ The `memberlist_config` configures the Gossip memberlist.
 # CLI flag: -memberlist.leave-timeout
 [leave_timeout: <duration> | default = 5s]
 
+# How much space to use for keeping received and sent messages in memory for
+# troubleshooting (two buffers). 0 to disable.
+# CLI flag: -memberlist.message-history-buffer-bytes
+[message_history_buffer_bytes: <int> | default = 0]
+
 # IP address to listen on for gossip messages. Multiple addresses may be
 # specified. Defaults to 0.0.0.0
 # CLI flag: -memberlist.bind-addr
@@ -3027,6 +3388,11 @@ The `limits_config` configures default and per-tenant limits imposed by Cortex s
 # Prometheus label to look for in samples to identify a Prometheus HA replica.
 # CLI flag: -distributor.ha-tracker.replica
 [ha_replica_label: <string> | default = "__replica__"]
+
+# Maximum number of clusters that HA tracker will keep track of for single user.
+# 0 to disable the limit.
+# CLI flag: -distributor.ha-tracker.max-clusters
+[ha_max_clusters: <int> | default = 0]
 
 # This flag can be used to specify label names that to drop during sample
 # ingestion within the distributor and can be repeated in order to drop multiple
@@ -3459,6 +3825,10 @@ The `configstore_config` configures the config database storing rules and alerts
 # CLI flag: -<prefix>.configs.tls-ca-path
 [tls_ca_path: <string> | default = ""]
 
+# Override the expected name on the server certificate.
+# CLI flag: -<prefix>.configs.tls-server-name
+[tls_server_name: <string> | default = ""]
+
 # Skip validating server certificate.
 # CLI flag: -<prefix>.configs.tls-insecure-skip-verify
 [tls_insecure_skip_verify: <boolean> | default = false]
@@ -3504,6 +3874,20 @@ s3:
   # CLI flag: -blocks-storage.s3.signature-version
   [signature_version: <string> | default = "v4"]
 
+  sse:
+    # Enable AWS Server Side Encryption. Only SSE-S3 and SSE-KMS are supported
+    # CLI flag: -blocks-storage.s3.sse.type
+    [type: <string> | default = ""]
+
+    # KMS Key ID used to encrypt objects in S3
+    # CLI flag: -blocks-storage.s3.sse.kms-key-id
+    [kms_key_id: <string> | default = ""]
+
+    # KMS Encryption Context used for object encryption. It expects JSON
+    # formatted string.
+    # CLI flag: -blocks-storage.s3.sse.kms-encryption-context
+    [kms_encryption_context: <string> | default = ""]
+
   http:
     # The time an idle connection will remain idle before closing.
     # CLI flag: -blocks-storage.s3.http.idle-conn-timeout
@@ -3517,6 +3901,30 @@ s3:
     # client will accept any certificate and hostname.
     # CLI flag: -blocks-storage.s3.http.insecure-skip-verify
     [insecure_skip_verify: <boolean> | default = false]
+
+    # Maximum time to wait for a TLS handshake. 0 means no limit.
+    # CLI flag: -blocks-storage.s3.tls-handshake-timeout
+    [tls_handshake_timeout: <duration> | default = 10s]
+
+    # The time to wait for a server's first response headers after fully writing
+    # the request headers if the request has an Expect header. 0 to send the
+    # request body immediately.
+    # CLI flag: -blocks-storage.s3.expect-continue-timeout
+    [expect_continue_timeout: <duration> | default = 1s]
+
+    # Maximum number of idle (keep-alive) connections across all hosts. 0 means
+    # no limit.
+    # CLI flag: -blocks-storage.s3.max-idle-connections
+    [max_idle_connections: <int> | default = 100]
+
+    # Maximum number of idle (keep-alive) connections to keep per-host. If 0, a
+    # built-in default value is used.
+    # CLI flag: -blocks-storage.s3.max-idle-connections-per-host
+    [max_idle_connections_per_host: <int> | default = 100]
+
+    # Maximum number of connections per host. 0 means no limit.
+    # CLI flag: -blocks-storage.s3.max-connections-per-host
+    [max_connections_per_host: <int> | default = 0]
 
 gcs:
   # GCS bucket name
@@ -3552,6 +3960,10 @@ azure:
   [max_retries: <int> | default = 20]
 
 swift:
+  # OpenStack Swift authentication API version. 0 to autodetect.
+  # CLI flag: -blocks-storage.swift.auth-version
+  [auth_version: <int> | default = 0]
+
   # OpenStack Swift authentication URL
   # CLI flag: -blocks-storage.swift.auth-url
   [auth_url: <string> | default = ""]
@@ -3610,25 +4022,40 @@ swift:
   # CLI flag: -blocks-storage.swift.container-name
   [container_name: <string> | default = ""]
 
+  # Max retries on requests error.
+  # CLI flag: -blocks-storage.swift.max-retries
+  [max_retries: <int> | default = 3]
+
+  # Time after which a connection attempt is aborted.
+  # CLI flag: -blocks-storage.swift.connect-timeout
+  [connect_timeout: <duration> | default = 10s]
+
+  # Time after which an idle request is aborted. The timeout watchdog is reset
+  # each time some data is received, so the timeout triggers after X time no
+  # data is received on a request.
+  # CLI flag: -blocks-storage.swift.request-timeout
+  [request_timeout: <duration> | default = 5s]
+
 filesystem:
   # Local filesystem storage directory.
   # CLI flag: -blocks-storage.filesystem.dir
   [dir: <string> | default = ""]
 
-# This configures how the store-gateway synchronizes blocks stored in the
-# bucket.
+# This configures how the querier and store-gateway discover and synchronize
+# blocks stored in the bucket.
 bucket_store:
   # Directory to store synchronized TSDB index headers.
   # CLI flag: -blocks-storage.bucket-store.sync-dir
   [sync_dir: <string> | default = "tsdb-sync"]
 
-  # How frequently scan the bucket to look for changes (new blocks shipped by
-  # ingesters and blocks removed by retention or compaction). 0 disables it.
+  # How frequently to scan the bucket, or to refresh the bucket index (if
+  # enabled), in order to look for changes (new blocks shipped by ingesters and
+  # blocks deleted by retention or compaction).
   # CLI flag: -blocks-storage.bucket-store.sync-interval
-  [sync_interval: <duration> | default = 5m]
+  [sync_interval: <duration> | default = 15m]
 
-  # Max size - in bytes - of a per-tenant chunk pool, used to reduce memory
-  # allocations.
+  # Max size - in bytes - of a chunks pool, used to reduce memory allocations.
+  # The pool is shared across all tenants.
   # CLI flag: -blocks-storage.bucket-store.max-chunk-pool-bytes
   [max_chunk_pool_bytes: <int> | default = 2147483648]
 
@@ -3852,13 +4279,33 @@ bucket_store:
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-content-ttl
     [metafile_content_ttl: <duration> | default = 24h]
 
-    # Maximum size of metafile content to cache in bytes.
+    # Maximum size of metafile content to cache in bytes. Caching will be
+    # skipped if the content exceeds this size. This is useful to avoid network
+    # round trip for large content if the configured caching backend has an hard
+    # limit on cached items size (in this case, you should set this limit to the
+    # same limit in the caching backend).
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-max-size-bytes
     [metafile_max_size_bytes: <int> | default = 1048576]
 
     # How long to cache attributes of the block metafile.
     # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-attributes-ttl
     [metafile_attributes_ttl: <duration> | default = 168h]
+
+    # How long to cache attributes of the block index.
+    # CLI flag: -blocks-storage.bucket-store.metadata-cache.block-index-attributes-ttl
+    [block_index_attributes_ttl: <duration> | default = 168h]
+
+    # How long to cache content of the bucket index.
+    # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-content-ttl
+    [bucket_index_content_ttl: <duration> | default = 5m]
+
+    # Maximum size of bucket index content to cache in bytes. Caching will be
+    # skipped if the content exceeds this size. This is useful to avoid network
+    # round trip for large content if the configured caching backend has an hard
+    # limit on cached items size (in this case, you should set this limit to the
+    # same limit in the caching backend).
+    # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-max-size-bytes
+    [bucket_index_max_size_bytes: <int> | default = 1048576]
 
   # Duration after which the blocks marked for deletion will be filtered out
   # while fetching blocks. The idea of ignore-deletion-marks-delay is to ignore
@@ -3868,6 +4315,41 @@ bucket_store:
   # -compactor.deletion-delay.
   # CLI flag: -blocks-storage.bucket-store.ignore-deletion-marks-delay
   [ignore_deletion_mark_delay: <duration> | default = 6h]
+
+  bucket_index:
+    # True to enable querier and store-gateway to discover blocks in the storage
+    # via bucket index instead of bucket scanning.
+    # CLI flag: -blocks-storage.bucket-store.bucket-index.enabled
+    [enabled: <boolean> | default = false]
+
+    # How frequently a bucket index, which previously failed to load, should be
+    # tried to load again. This option is used only by querier.
+    # CLI flag: -blocks-storage.bucket-store.bucket-index.update-on-error-interval
+    [update_on_error_interval: <duration> | default = 1m]
+
+    # How long a unused bucket index should be cached. Once this timeout
+    # expires, the unused bucket index is removed from the in-memory cache. This
+    # option is used only by querier.
+    # CLI flag: -blocks-storage.bucket-store.bucket-index.idle-timeout
+    [idle_timeout: <duration> | default = 1h]
+
+    # The maximum allowed age of a bucket index (last updated) before queries
+    # start failing because the bucket index is too old. The bucket index is
+    # periodically updated by the compactor, while this check is enforced in the
+    # querier (at query time).
+    # CLI flag: -blocks-storage.bucket-store.bucket-index.max-stale-period
+    [max_stale_period: <duration> | default = 1h]
+
+  # If enabled, store-gateway will lazy load an index-header only once required
+  # by a query.
+  # CLI flag: -blocks-storage.bucket-store.index-header-lazy-loading-enabled
+  [index_header_lazy_loading_enabled: <boolean> | default = false]
+
+  # If index-header lazy loading is enabled and this setting is > 0, the
+  # store-gateway will offload unused index-headers after 'idle timeout'
+  # inactivity.
+  # CLI flag: -blocks-storage.bucket-store.index-header-lazy-loading-idle-timeout
+  [index_header_lazy_loading_idle_timeout: <duration> | default = 20m]
 
 tsdb:
   # Local directory to store TSDBs in the ingesters.
@@ -3979,8 +4461,7 @@ The `compactor_config` configures the compactor for the blocks storage.
 # CLI flag: -compactor.compaction-interval
 [compaction_interval: <duration> | default = 1h]
 
-# How many times to retry a failed compaction during a single compaction
-# interval
+# How many times to retry a failed compaction within a single compaction run.
 # CLI flag: -compactor.compaction-retries
 [compaction_retries: <int> | default = 3]
 
@@ -3988,19 +4469,35 @@ The `compactor_config` configures the compactor for the blocks storage.
 # CLI flag: -compactor.compaction-concurrency
 [compaction_concurrency: <int> | default = 1]
 
-# Max number of tenants for which blocks should be cleaned up concurrently
-# (deletion of blocks previously marked for deletion).
+# How frequently compactor should run blocks cleanup and maintenance, as well as
+# update the bucket index.
+# CLI flag: -compactor.cleanup-interval
+[cleanup_interval: <duration> | default = 15m]
+
+# Max number of tenants for which blocks cleanup and maintenance should run
+# concurrently.
 # CLI flag: -compactor.cleanup-concurrency
 [cleanup_concurrency: <int> | default = 20]
 
 # Time before a block marked for deletion is deleted from bucket. If not 0,
-# blocks will be marked for deletion and compactor component will delete blocks
-# marked for deletion from the bucket. If delete-delay is 0, blocks will be
+# blocks will be marked for deletion and compactor component will permanently
+# delete blocks marked for deletion from the bucket. If 0, blocks will be
 # deleted straight away. Note that deleting blocks immediately can cause query
-# failures, if store gateway still has the block loaded, or compactor is
-# ignoring the deletion because it's compacting the block at the same time.
+# failures.
 # CLI flag: -compactor.deletion-delay
 [deletion_delay: <duration> | default = 12h]
+
+# For tenants marked for deletion, this is time between deleting of last block,
+# and doing final cleanup (marker files, debug files) of the tenant.
+# CLI flag: -compactor.tenant-cleanup-delay
+[tenant_cleanup_delay: <duration> | default = 6h]
+
+# When enabled, at compactor startup the bucket will be scanned and all found
+# deletion marks inside the block location will be copied to the markers global
+# location too. This option can (and should) be safely disabled as soon as the
+# compactor has successfully run at least once.
+# CLI flag: -compactor.block-deletion-marks-migration-enabled
+[block_deletion_marks_migration_enabled: <boolean> | default = true]
 
 # Comma separated list of tenants that can be compacted. If specified, only
 # these tenants will be compacted by compactor, otherwise all tenants can be

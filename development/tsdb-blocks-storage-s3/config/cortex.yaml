@@ -86,6 +86,15 @@ ruler:
 
 alertmanager:
   enable_api: true
+  sharding_enabled: true
+  sharding_ring:
+    replication_factor: 3
+    heartbeat_period: 5s
+    heartbeat_timeout: 15s
+    kvstore:
+      store: consul
+      consul:
+        host: consul:8500
   storage:
     type: s3
     s3:
@@ -101,6 +110,8 @@ compactor:
   data_dir:            /tmp/cortex-compactor
   consistency_delay:   1m
   sharding_enabled:    true
+  cleanup_interval:    1m
+  tenant_cleanup_delay: 1m
   sharding_ring:
     kvstore:
       store: consul
@@ -134,3 +145,6 @@ query_range:
 limits:
   # Limit max query time range to 31d
   max_query_length: 744h
+
+runtime_config:
+  file: ./config/runtime.yaml

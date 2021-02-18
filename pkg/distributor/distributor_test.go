@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-kit/kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
@@ -25,8 +26,10 @@ import (
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 
 	"github.com/cortexproject/cortex/pkg/chunk/encoding"
+	"github.com/cortexproject/cortex/pkg/cortexpb"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 	"github.com/cortexproject/cortex/pkg/ring"
@@ -37,15 +40,16 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/chunkcompat"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	util_math "github.com/cortexproject/cortex/pkg/util/math"
 	"github.com/cortexproject/cortex/pkg/util/services"
 	"github.com/cortexproject/cortex/pkg/util/test"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 var (
-	errFail = fmt.Errorf("Fail")
-	success = &client.WriteResponse{}
-	ctx     = user.InjectOrgID(context.Background(), "user")
+	errFail       = fmt.Errorf("Fail")
+	emptyResponse = &cortexpb.WriteResponse{}
+	ctx           = user.InjectOrgID(context.Background(), "user")
 )
 
 func TestConfig_Validate(t *testing.T) {
@@ -116,21 +120,21 @@ func TestDistributor_Push(t *testing.T) {
 		happyIngesters   int
 		samples          samplesIn
 		metadata         int
-		expectedResponse *client.WriteResponse
+		expectedResponse *cortexpb.WriteResponse
 		expectedError    error
 		expectedMetrics  string
 	}{
 		"A push of no samples shouldn't block or return error, even if ingesters are sad": {
 			numIngesters:     3,
 			happyIngesters:   0,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 		},
 		"A push to 3 happy ingesters should succeed": {
 			numIngesters:     3,
 			happyIngesters:   3,
 			samples:          samplesIn{num: 5, startTimestampMs: 123456789000},
 			metadata:         5,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 			metricNames:      []string{lastSeenTimestamp},
 			expectedMetrics: `
 				# HELP cortex_distributor_latest_seen_sample_timestamp_seconds Unix timestamp of latest received sample per user.
@@ -143,7 +147,7 @@ func TestDistributor_Push(t *testing.T) {
 			happyIngesters:   2,
 			samples:          samplesIn{num: 5, startTimestampMs: 123456789000},
 			metadata:         5,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 			metricNames:      []string{lastSeenTimestamp},
 			expectedMetrics: `
 				# HELP cortex_distributor_latest_seen_sample_timestamp_seconds Unix timestamp of latest received sample per user.
@@ -194,7 +198,7 @@ func TestDistributor_Push(t *testing.T) {
 			samples:          samplesIn{num: 1, startTimestampMs: 123456789000},
 			metadata:         0,
 			metricNames:      []string{distributorAppend, distributorAppendFailure},
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 			expectedMetrics: `
 				# HELP cortex_distributor_ingester_append_failures_total The total number of failed batch appends sent to ingesters.
 				# TYPE cortex_distributor_ingester_append_failures_total counter
@@ -212,7 +216,7 @@ func TestDistributor_Push(t *testing.T) {
 			samples:          samplesIn{num: 0, startTimestampMs: 123456789000},
 			metadata:         1,
 			metricNames:      []string{distributorAppend, distributorAppendFailure},
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 			expectedMetrics: `
 				# HELP cortex_distributor_ingester_append_failures_total The total number of failed batch appends sent to ingesters.
 				# TYPE cortex_distributor_ingester_append_failures_total counter
@@ -264,6 +268,95 @@ func TestDistributor_Push(t *testing.T) {
 	}
 }
 
+func TestDistributor_MetricsCleanup(t *testing.T) {
+	receivedSamples.Reset()
+	receivedMetadata.Reset()
+	incomingSamples.Reset()
+	incomingMetadata.Reset()
+	nonHASamples.Reset()
+	dedupedSamples.Reset()
+	latestSeenSampleTimestampPerUser.Reset()
+
+	metrics := []string{
+		"cortex_distributor_received_samples_total",
+		"cortex_distributor_received_metadata_total",
+		"cortex_distributor_deduped_samples_total",
+		"cortex_distributor_samples_in_total",
+		"cortex_distributor_metadata_in_total",
+		"cortex_distributor_non_ha_samples_received_total",
+		"cortex_distributor_latest_seen_sample_timestamp_seconds",
+	}
+
+	receivedSamples.WithLabelValues("userA").Add(5)
+	receivedSamples.WithLabelValues("userB").Add(10)
+	receivedMetadata.WithLabelValues("userA").Add(5)
+	receivedMetadata.WithLabelValues("userB").Add(10)
+	incomingSamples.WithLabelValues("userA").Add(5)
+	incomingMetadata.WithLabelValues("userA").Add(5)
+	nonHASamples.WithLabelValues("userA").Add(5)
+	dedupedSamples.WithLabelValues("userA", "cluster1").Inc() // We cannot clean this metric
+	latestSeenSampleTimestampPerUser.WithLabelValues("userA").Set(1111)
+
+	require.NoError(t, testutil.GatherAndCompare(prometheus.DefaultGatherer, strings.NewReader(`
+		# HELP cortex_distributor_deduped_samples_total The total number of deduplicated samples.
+		# TYPE cortex_distributor_deduped_samples_total counter
+		cortex_distributor_deduped_samples_total{cluster="cluster1",user="userA"} 1
+
+		# HELP cortex_distributor_latest_seen_sample_timestamp_seconds Unix timestamp of latest received sample per user.
+		# TYPE cortex_distributor_latest_seen_sample_timestamp_seconds gauge
+		cortex_distributor_latest_seen_sample_timestamp_seconds{user="userA"} 1111
+
+		# HELP cortex_distributor_metadata_in_total The total number of metadata the have come in to the distributor, including rejected.
+		# TYPE cortex_distributor_metadata_in_total counter
+		cortex_distributor_metadata_in_total{user="userA"} 5
+
+		# HELP cortex_distributor_non_ha_samples_received_total The total number of received samples for a user that has HA tracking turned on, but the sample didn't contain both HA labels.
+		# TYPE cortex_distributor_non_ha_samples_received_total counter
+		cortex_distributor_non_ha_samples_received_total{user="userA"} 5
+
+		# HELP cortex_distributor_received_metadata_total The total number of received metadata, excluding rejected.
+		# TYPE cortex_distributor_received_metadata_total counter
+		cortex_distributor_received_metadata_total{user="userA"} 5
+		cortex_distributor_received_metadata_total{user="userB"} 10
+
+		# HELP cortex_distributor_received_samples_total The total number of received samples, excluding rejected and deduped samples.
+		# TYPE cortex_distributor_received_samples_total counter
+		cortex_distributor_received_samples_total{user="userA"} 5
+		cortex_distributor_received_samples_total{user="userB"} 10
+
+		# HELP cortex_distributor_samples_in_total The total number of samples that have come in to the distributor, including rejected or deduped samples.
+		# TYPE cortex_distributor_samples_in_total counter
+		cortex_distributor_samples_in_total{user="userA"} 5
+`), metrics...))
+
+	cleanupMetricsForUser("userA", log.NewNopLogger())
+
+	require.NoError(t, testutil.GatherAndCompare(prometheus.DefaultGatherer, strings.NewReader(`
+		# HELP cortex_distributor_deduped_samples_total The total number of deduplicated samples.
+		# TYPE cortex_distributor_deduped_samples_total counter
+
+		# HELP cortex_distributor_latest_seen_sample_timestamp_seconds Unix timestamp of latest received sample per user.
+		# TYPE cortex_distributor_latest_seen_sample_timestamp_seconds gauge
+
+		# HELP cortex_distributor_metadata_in_total The total number of metadata the have come in to the distributor, including rejected.
+		# TYPE cortex_distributor_metadata_in_total counter
+
+		# HELP cortex_distributor_non_ha_samples_received_total The total number of received samples for a user that has HA tracking turned on, but the sample didn't contain both HA labels.
+		# TYPE cortex_distributor_non_ha_samples_received_total counter
+
+		# HELP cortex_distributor_received_metadata_total The total number of received metadata, excluding rejected.
+		# TYPE cortex_distributor_received_metadata_total counter
+		cortex_distributor_received_metadata_total{user="userB"} 10
+
+		# HELP cortex_distributor_received_samples_total The total number of received samples, excluding rejected and deduped samples.
+		# TYPE cortex_distributor_received_samples_total counter
+		cortex_distributor_received_samples_total{user="userB"} 10
+
+		# HELP cortex_distributor_samples_in_total The total number of samples that have come in to the distributor, including rejected or deduped samples.
+		# TYPE cortex_distributor_samples_in_total counter
+`), metrics...))
+}
+
 func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 	type testPush struct {
 		samples       int
@@ -276,6 +369,7 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 		ingestionRateStrategy string
 		ingestionRate         float64
 		ingestionBurstSize    int
+		ingestionFailing      bool
 		pushes                []testPush
 	}{
 		"local strategy: limit should be set to each distributor": {
@@ -320,6 +414,17 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 				{metadata: 1, expectedError: httpgrpc.Errorf(http.StatusTooManyRequests, "ingestion rate limit (5) exceeded while adding 0 samples and 1 metadata")},
 			},
 		},
+		"unhappy ingesters: rate limit should be unaffected when ingestion fails": {
+			distributors:          1,
+			ingestionRateStrategy: validation.LocalIngestionRateStrategy,
+			ingestionRate:         10,
+			ingestionBurstSize:    10,
+			ingestionFailing:      true,
+			pushes: []testPush{
+				{samples: 10, expectedError: errFail},
+				{samples: 10, expectedError: errFail},
+			},
+		},
 	}
 
 	for testName, testData := range tests {
@@ -332,10 +437,15 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 			limits.IngestionRate = testData.ingestionRate
 			limits.IngestionBurstSize = testData.ingestionBurstSize
 
+			happyIngesters := 3
+			if testData.ingestionFailing {
+				happyIngesters = 0
+			}
+
 			// Start all expected distributors
 			distributors, _, r := prepare(t, prepConfig{
 				numIngesters:     3,
-				happyIngesters:   3,
+				happyIngesters:   happyIngesters,
 				numDistributors:  testData.distributors,
 				shardByAllLabels: true,
 				limits:           limits,
@@ -348,7 +458,7 @@ func TestDistributor_PushIngestionRateLimiter(t *testing.T) {
 				response, err := distributors[0].Push(ctx, request)
 
 				if push.expectedError == nil {
-					assert.Equal(t, success, response)
+					assert.Equal(t, emptyResponse, response)
 					assert.Nil(t, err)
 				} else {
 					assert.Nil(t, response)
@@ -368,7 +478,7 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 		testReplica      string
 		cluster          string
 		samples          int
-		expectedResponse *client.WriteResponse
+		expectedResponse *cortexpb.WriteResponse
 		expectedCode     int32
 	}{
 		{
@@ -377,7 +487,7 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 			testReplica:      "instance0",
 			cluster:          "cluster0",
 			samples:          5,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
 		},
 		// The 202 indicates that we didn't accept this sample.
 		{
@@ -395,7 +505,17 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 			testReplica:      "instance0",
 			cluster:          "cluster0",
 			samples:          5,
-			expectedResponse: success,
+			expectedResponse: emptyResponse,
+		},
+		// Using very long replica label value results in validation error.
+		{
+			enableTracker:    true,
+			acceptedReplica:  "instance0",
+			testReplica:      "instance1234567890123456789012345678901234567890",
+			cluster:          "cluster0",
+			samples:          5,
+			expectedResponse: emptyResponse,
+			expectedCode:     400,
 		},
 	} {
 		for _, shardByAllLabels := range []bool{true, false} {
@@ -403,6 +523,7 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 				var limits validation.Limits
 				flagext.DefaultValues(&limits)
 				limits.AcceptHASamples = true
+				limits.MaxLabelValueLength = 15
 
 				ds, _, r := prepare(t, prepConfig{
 					numIngesters:     3,
@@ -417,12 +538,12 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 				d := ds[0]
 
 				if tc.enableTracker {
-					r, err := newClusterTracker(HATrackerConfig{
+					r, err := newHATracker(HATrackerConfig{
 						EnableHATracker: true,
 						KVStore:         kv.Config{Mock: mock},
 						UpdateTimeout:   100 * time.Millisecond,
 						FailoverTimeout: time.Second,
-					}, nil)
+					}, trackerLimits{maxClusters: 100}, nil, log.NewNopLogger())
 					require.NoError(t, err)
 					require.NoError(t, services.StartAndAwaitRunning(context.Background(), r))
 					d.HATracker = r
@@ -430,7 +551,7 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 
 				userID, err := tenant.TenantID(ctx)
 				assert.NoError(t, err)
-				err = d.HATracker.checkReplica(ctx, userID, tc.cluster, tc.acceptedReplica)
+				err = d.HATracker.checkReplica(ctx, userID, tc.cluster, tc.acceptedReplica, time.Now())
 				assert.NoError(t, err)
 
 				request := makeWriteRequestHA(tc.samples, tc.testReplica, tc.cluster)
@@ -440,6 +561,8 @@ func TestDistributor_PushHAInstances(t *testing.T) {
 				httpResp, ok := httpgrpc.HTTPResponseFromError(err)
 				if ok {
 					assert.Equal(t, tc.expectedCode, httpResp.Code)
+				} else if tc.expectedCode != 0 {
+					assert.Fail(t, "expected HTTP status code", tc.expectedCode)
 				}
 			})
 		}
@@ -487,7 +610,7 @@ func TestDistributor_PushQuery(t *testing.T) {
 					// shard by all labels are enabled.
 					var expectedIngesters int
 					if shuffleShardEnabled {
-						expectedIngesters = util.Min(shuffleShardSize, numIngesters)
+						expectedIngesters = util_math.Min(shuffleShardSize, numIngesters)
 					} else if shardByAllLabels {
 						expectedIngesters = numIngesters
 					} else {
@@ -590,7 +713,7 @@ func TestDistributor_PushQuery(t *testing.T) {
 
 			request := makeWriteRequest(0, tc.samples, tc.metadata)
 			writeResponse, err := ds[0].Push(ctx, request)
-			assert.Equal(t, &client.WriteResponse{}, writeResponse)
+			assert.Equal(t, &cortexpb.WriteResponse{}, writeResponse)
 			assert.Nil(t, err)
 
 			response, err := ds[0].Query(ctx, 0, 10, tc.matchers...)
@@ -704,7 +827,7 @@ func TestDistributor_Push_LabelRemoval(t *testing.T) {
 			timeseries := ingesters[i].series()
 			assert.Equal(t, 1, len(timeseries))
 			for _, v := range timeseries {
-				assert.Equal(t, tc.expectedSeries, client.FromLabelAdaptersToLabels(v.Labels))
+				assert.Equal(t, tc.expectedSeries, cortexpb.FromLabelAdaptersToLabels(v.Labels))
 			}
 		}
 	}
@@ -812,7 +935,58 @@ func TestDistributor_Push_ShouldGuaranteeShardingTokenConsistencyOverTheTime(t *
 
 				series, ok := timeseries[testData.expectedToken]
 				require.True(t, ok)
-				assert.Equal(t, testData.expectedSeries, client.FromLabelAdaptersToLabels(series.Labels))
+				assert.Equal(t, testData.expectedSeries, cortexpb.FromLabelAdaptersToLabels(series.Labels))
+			}
+		})
+	}
+}
+
+func TestDistributor_Push_LabelNameValidation(t *testing.T) {
+	inputLabels := labels.Labels{
+		{Name: model.MetricNameLabel, Value: "foo"},
+		{Name: "999.illegal", Value: "baz"},
+	}
+	tests := map[string]struct {
+		inputLabels                labels.Labels
+		skipLabelNameValidationCfg bool
+		skipLabelNameValidationReq bool
+		errExpected                bool
+		errMessage                 string
+	}{
+		"label name validation is on by default": {
+			inputLabels: inputLabels,
+			errExpected: true,
+			errMessage:  `sample invalid label: "999.illegal" metric "foo{999.illegal=\"baz\"}"`,
+		},
+		"label name validation can be skipped via config": {
+			inputLabels:                inputLabels,
+			skipLabelNameValidationCfg: true,
+			errExpected:                false,
+		},
+		"label name validation can be skipped via WriteRequest parameter": {
+			inputLabels:                inputLabels,
+			skipLabelNameValidationReq: true,
+			errExpected:                false,
+		},
+	}
+
+	for testName, tc := range tests {
+		t.Run(testName, func(t *testing.T) {
+			ds, _, _ := prepare(t, prepConfig{
+				numIngesters:            2,
+				happyIngesters:          2,
+				numDistributors:         1,
+				shuffleShardSize:        1,
+				skipLabelNameValidation: tc.skipLabelNameValidationCfg,
+			})
+			req := mockWriteRequest(tc.inputLabels, 42, 100000)
+			req.SkipLabelNameValidation = tc.skipLabelNameValidationReq
+			_, err := ds[0].Push(ctx, req)
+			if tc.errExpected {
+				fromError, _ := status.FromError(err)
+				assert.Equal(t, tc.errMessage, fromError.Message())
+			} else {
+				assert.Nil(t, err)
 			}
 		})
 	}
@@ -1039,15 +1213,15 @@ func mustNewMatcher(t labels.MatchType, n, v string) *labels.Matcher {
 	return m
 }
 
-func mockWriteRequest(lbls labels.Labels, value float64, timestampMs int64) *client.WriteRequest {
-	samples := []client.Sample{
+func mockWriteRequest(lbls labels.Labels, value float64, timestampMs int64) *cortexpb.WriteRequest {
+	samples := []cortexpb.Sample{
 		{
 			TimestampMs: timestampMs,
 			Value:       value,
 		},
 	}
 
-	return client.ToWriteRequest([]labels.Labels{lbls}, samples, nil, client.API)
+	return cortexpb.ToWriteRequest([]labels.Labels{lbls}, samples, nil, cortexpb.API)
 }
 
 type prepConfig struct {
@@ -1058,6 +1232,7 @@ type prepConfig struct {
 	shuffleShardSize             int
 	limits                       *validation.Limits
 	numDistributors              int
+	skipLabelNameValidation      bool
 }
 
 func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *ring.Ring) {
@@ -1075,11 +1250,11 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 	}
 
 	// Use a real ring with a mock KV store to test ring RF logic.
-	ingesterDescs := map[string]ring.IngesterDesc{}
+	ingesterDescs := map[string]ring.InstanceDesc{}
 	ingestersByAddr := map[string]*mockIngester{}
 	for i := range ingesters {
 		addr := fmt.Sprintf("%d", i)
-		ingesterDescs[addr] = ring.IngesterDesc{
+		ingesterDescs[addr] = ring.InstanceDesc{
 			Addr:                addr,
 			Zone:                "",
 			State:               ring.ACTIVE,
@@ -1106,13 +1281,12 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 		},
 		HeartbeatTimeout:  60 * time.Minute,
 		ReplicationFactor: 3,
-		ExtendWrites:      true,
 	}, ring.IngesterRingKey, ring.IngesterRingKey, nil)
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), ingestersRing))
 
 	test.Poll(t, time.Second, cfg.numIngesters, func() interface{} {
-		return ingestersRing.IngesterCount()
+		return ingestersRing.InstancesCount()
 	})
 
 	factory := func(addr string) (ring_client.PoolClient, error) {
@@ -1137,6 +1311,7 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 		distributorCfg.DistributorRing.InstanceID = strconv.Itoa(i)
 		distributorCfg.DistributorRing.KVStore.Mock = kvStore
 		distributorCfg.DistributorRing.InstanceAddr = "127.0.0.1"
+		distributorCfg.SkipLabelNameValidation = cfg.skipLabelNameValidation
 
 		if cfg.shuffleShardEnabled {
 			distributorCfg.ShardingStrategy = util.ShardingStrategyShuffle
@@ -1148,7 +1323,7 @@ func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *rin
 		overrides, err := validation.NewOverrides(*cfg.limits, nil)
 		require.NoError(t, err)
 
-		d, err := New(distributorCfg, clientConfig, overrides, ingestersRing, true, nil)
+		d, err := New(distributorCfg, clientConfig, overrides, ingestersRing, true, nil, log.NewNopLogger())
 		require.NoError(t, err)
 		require.NoError(t, services.StartAndAwaitRunning(context.Background(), d))
 
@@ -1175,19 +1350,19 @@ func stopAll(ds []*Distributor, r *ring.Ring) {
 	r.StopAsync()
 }
 
-func makeWriteRequest(startTimestampMs int64, samples int, metadata int) *client.WriteRequest {
-	request := &client.WriteRequest{}
+func makeWriteRequest(startTimestampMs int64, samples int, metadata int) *cortexpb.WriteRequest {
+	request := &cortexpb.WriteRequest{}
 	for i := 0; i < samples; i++ {
-		ts := client.PreallocTimeseries{
-			TimeSeries: &client.TimeSeries{
-				Labels: []client.LabelAdapter{
+		ts := cortexpb.PreallocTimeseries{
+			TimeSeries: &cortexpb.TimeSeries{
+				Labels: []cortexpb.LabelAdapter{
 					{Name: model.MetricNameLabel, Value: "foo"},
 					{Name: "bar", Value: "baz"},
 					{Name: "sample", Value: fmt.Sprintf("%d", i)},
 				},
 			},
 		}
-		ts.Samples = []client.Sample{
+		ts.Samples = []cortexpb.Sample{
 			{
 				Value:       float64(i),
 				TimestampMs: startTimestampMs + int64(i),
@@ -1197,9 +1372,9 @@ func makeWriteRequest(startTimestampMs int64, samples int, metadata int) *client
 	}
 
 	for i := 0; i < metadata; i++ {
-		m := &client.MetricMetadata{
+		m := &cortexpb.MetricMetadata{
 			MetricFamilyName: fmt.Sprintf("metric_%d", i),
-			Type:             client.COUNTER,
+			Type:             cortexpb.COUNTER,
 			Help:             fmt.Sprintf("a help for metric_%d", i),
 		}
 		request.Metadata = append(request.Metadata, m)
@@ -1208,12 +1383,12 @@ func makeWriteRequest(startTimestampMs int64, samples int, metadata int) *client
 	return request
 }
 
-func makeWriteRequestHA(samples int, replica, cluster string) *client.WriteRequest {
-	request := &client.WriteRequest{}
+func makeWriteRequestHA(samples int, replica, cluster string) *cortexpb.WriteRequest {
+	request := &cortexpb.WriteRequest{}
 	for i := 0; i < samples; i++ {
-		ts := client.PreallocTimeseries{
-			TimeSeries: &client.TimeSeries{
-				Labels: []client.LabelAdapter{
+		ts := cortexpb.PreallocTimeseries{
+			TimeSeries: &cortexpb.TimeSeries{
+				Labels: []cortexpb.LabelAdapter{
 					{Name: "__name__", Value: "foo"},
 					{Name: "__replica__", Value: replica},
 					{Name: "bar", Value: "baz"},
@@ -1222,7 +1397,7 @@ func makeWriteRequestHA(samples int, replica, cluster string) *client.WriteReque
 				},
 			},
 		}
-		ts.Samples = []client.Sample{
+		ts.Samples = []cortexpb.Sample{
 			{
 				Value:       float64(i),
 				TimestampMs: int64(i),
@@ -1267,17 +1442,17 @@ type mockIngester struct {
 	grpc_health_v1.HealthClient
 	happy      bool
 	stats      client.UsersStatsResponse
-	timeseries map[uint32]*client.PreallocTimeseries
-	metadata   map[uint32]map[client.MetricMetadata]struct{}
+	timeseries map[uint32]*cortexpb.PreallocTimeseries
+	metadata   map[uint32]map[cortexpb.MetricMetadata]struct{}
 	queryDelay time.Duration
 	calls      map[string]int
 }
 
-func (i *mockIngester) series() map[uint32]*client.PreallocTimeseries {
+func (i *mockIngester) series() map[uint32]*cortexpb.PreallocTimeseries {
 	i.Lock()
 	defer i.Unlock()
 
-	result := map[uint32]*client.PreallocTimeseries{}
+	result := map[uint32]*cortexpb.PreallocTimeseries{}
 	for k, v := range i.timeseries {
 		result[k] = v
 	}
@@ -1297,7 +1472,7 @@ func (i *mockIngester) Close() error {
 	return nil
 }
 
-func (i *mockIngester) Push(ctx context.Context, req *client.WriteRequest, opts ...grpc.CallOption) (*client.WriteResponse, error) {
+func (i *mockIngester) Push(ctx context.Context, req *cortexpb.WriteRequest, opts ...grpc.CallOption) (*cortexpb.WriteResponse, error) {
 	i.Lock()
 	defer i.Unlock()
 
@@ -1308,11 +1483,11 @@ func (i *mockIngester) Push(ctx context.Context, req *client.WriteRequest, opts 
 	}
 
 	if i.timeseries == nil {
-		i.timeseries = map[uint32]*client.PreallocTimeseries{}
+		i.timeseries = map[uint32]*cortexpb.PreallocTimeseries{}
 	}
 
 	if i.metadata == nil {
-		i.metadata = map[uint32]map[client.MetricMetadata]struct{}{}
+		i.metadata = map[uint32]map[cortexpb.MetricMetadata]struct{}{}
 	}
 
 	orgid, err := tenant.TenantID(ctx)
@@ -1326,15 +1501,15 @@ func (i *mockIngester) Push(ctx context.Context, req *client.WriteRequest, opts 
 		existing, ok := i.timeseries[hash]
 		if !ok {
 			// Make a copy because the request Timeseries are reused
-			item := client.TimeSeries{
-				Labels:  make([]client.LabelAdapter, len(series.TimeSeries.Labels)),
-				Samples: make([]client.Sample, len(series.TimeSeries.Samples)),
+			item := cortexpb.TimeSeries{
+				Labels:  make([]cortexpb.LabelAdapter, len(series.TimeSeries.Labels)),
+				Samples: make([]cortexpb.Sample, len(series.TimeSeries.Samples)),
 			}
 
 			copy(item.Labels, series.TimeSeries.Labels)
 			copy(item.Samples, series.TimeSeries.Samples)
 
-			i.timeseries[hash] = &client.PreallocTimeseries{TimeSeries: &item}
+			i.timeseries[hash] = &cortexpb.PreallocTimeseries{TimeSeries: &item}
 		} else {
 			existing.Samples = append(existing.Samples, series.Samples...)
 		}
@@ -1344,13 +1519,13 @@ func (i *mockIngester) Push(ctx context.Context, req *client.WriteRequest, opts 
 		hash := shardByMetricName(orgid, m.MetricFamilyName)
 		set, ok := i.metadata[hash]
 		if !ok {
-			set = map[client.MetricMetadata]struct{}{}
+			set = map[cortexpb.MetricMetadata]struct{}{}
 			i.metadata[hash] = set
 		}
 		set[*m] = struct{}{}
 	}
 
-	return &client.WriteResponse{}, nil
+	return &cortexpb.WriteResponse{}, nil
 }
 
 func (i *mockIngester) Query(ctx context.Context, req *client.QueryRequest, opts ...grpc.CallOption) (*client.QueryResponse, error) {
@@ -1464,7 +1639,7 @@ func (i *mockIngester) MetricsForLabelMatchers(ctx context.Context, req *client.
 	for _, matchers := range multiMatchers {
 		for _, ts := range i.timeseries {
 			if match(ts.Labels, matchers) {
-				response.Metric = append(response.Metric, &client.Metric{Labels: ts.Labels})
+				response.Metric = append(response.Metric, &cortexpb.Metric{Labels: ts.Labels})
 			}
 		}
 	}
@@ -1529,7 +1704,7 @@ func (i *mockIngester) AllUserStats(ctx context.Context, in *client.UserStatsReq
 	return &i.stats, nil
 }
 
-func match(labels []client.LabelAdapter, matchers []*labels.Matcher) bool {
+func match(labels []cortexpb.LabelAdapter, matchers []*labels.Matcher) bool {
 outer:
 	for _, matcher := range matchers {
 		for _, labels := range labels {
@@ -1548,16 +1723,16 @@ func TestDistributorValidation(t *testing.T) {
 	future, past := now.Add(5*time.Hour), now.Add(-25*time.Hour)
 
 	for i, tc := range []struct {
-		metadata []*client.MetricMetadata
+		metadata []*cortexpb.MetricMetadata
 		labels   []labels.Labels
-		samples  []client.Sample
+		samples  []cortexpb.Sample
 		err      error
 	}{
 		// Test validation passes.
 		{
-			metadata: []*client.MetricMetadata{{MetricFamilyName: "testmetric", Help: "a test metric.", Unit: "", Type: client.COUNTER}},
+			metadata: []*cortexpb.MetricMetadata{{MetricFamilyName: "testmetric", Help: "a test metric.", Unit: "", Type: cortexpb.COUNTER}},
 			labels:   []labels.Labels{{{Name: labels.MetricName, Value: "testmetric"}, {Name: "foo", Value: "bar"}}},
-			samples: []client.Sample{{
+			samples: []cortexpb.Sample{{
 				TimestampMs: int64(now),
 				Value:       1,
 			}},
@@ -1565,7 +1740,7 @@ func TestDistributorValidation(t *testing.T) {
 		// Test validation fails for very old samples.
 		{
 			labels: []labels.Labels{{{Name: labels.MetricName, Value: "testmetric"}, {Name: "foo", Value: "bar"}}},
-			samples: []client.Sample{{
+			samples: []cortexpb.Sample{{
 				TimestampMs: int64(past),
 				Value:       2,
 			}},
@@ -1575,7 +1750,7 @@ func TestDistributorValidation(t *testing.T) {
 		// Test validation fails for samples from the future.
 		{
 			labels: []labels.Labels{{{Name: labels.MetricName, Value: "testmetric"}, {Name: "foo", Value: "bar"}}},
-			samples: []client.Sample{{
+			samples: []cortexpb.Sample{{
 				TimestampMs: int64(future),
 				Value:       4,
 			}},
@@ -1585,11 +1760,11 @@ func TestDistributorValidation(t *testing.T) {
 		// Test maximum labels names per series.
 		{
 			labels: []labels.Labels{{{Name: labels.MetricName, Value: "testmetric"}, {Name: "foo", Value: "bar"}, {Name: "foo2", Value: "bar2"}}},
-			samples: []client.Sample{{
+			samples: []cortexpb.Sample{{
 				TimestampMs: int64(now),
 				Value:       2,
 			}},
-			err: httpgrpc.Errorf(http.StatusBadRequest, `sample for 'testmetric{foo2="bar2", foo="bar"}' has 3 label names; limit 2`),
+			err: httpgrpc.Errorf(http.StatusBadRequest, `series has too many labels (actual: 3, limit: 2) series: 'testmetric{foo2="bar2", foo="bar"}'`),
 		},
 		// Test multiple validation fails return the first one.
 		{
@@ -1597,17 +1772,17 @@ func TestDistributorValidation(t *testing.T) {
 				{{Name: labels.MetricName, Value: "testmetric"}, {Name: "foo", Value: "bar"}, {Name: "foo2", Value: "bar2"}},
 				{{Name: labels.MetricName, Value: "testmetric"}, {Name: "foo", Value: "bar"}},
 			},
-			samples: []client.Sample{
+			samples: []cortexpb.Sample{
 				{TimestampMs: int64(now), Value: 2},
 				{TimestampMs: int64(past), Value: 2},
 			},
-			err: httpgrpc.Errorf(http.StatusBadRequest, `sample for 'testmetric{foo2="bar2", foo="bar"}' has 3 label names; limit 2`),
+			err: httpgrpc.Errorf(http.StatusBadRequest, `series has too many labels (actual: 3, limit: 2) series: 'testmetric{foo2="bar2", foo="bar"}'`),
 		},
 		// Test metadata validation fails
 		{
-			metadata: []*client.MetricMetadata{{MetricFamilyName: "", Help: "a test metric.", Unit: "", Type: client.COUNTER}},
+			metadata: []*cortexpb.MetricMetadata{{MetricFamilyName: "", Help: "a test metric.", Unit: "", Type: cortexpb.COUNTER}},
 			labels:   []labels.Labels{{{Name: labels.MetricName, Value: "testmetric"}, {Name: "foo", Value: "bar"}}},
-			samples: []client.Sample{{
+			samples: []cortexpb.Sample{{
 				TimestampMs: int64(now),
 				Value:       1,
 			}},
@@ -1632,7 +1807,7 @@ func TestDistributorValidation(t *testing.T) {
 			})
 			defer stopAll(ds, r)
 
-			_, err := ds[0].Push(ctx, client.ToWriteRequest(tc.labels, tc.samples, tc.metadata, client.API))
+			_, err := ds[0].Push(ctx, cortexpb.ToWriteRequest(tc.labels, tc.samples, tc.metadata, cortexpb.API))
 			require.Equal(t, tc.err, err)
 		})
 	}
@@ -1642,18 +1817,18 @@ func TestRemoveReplicaLabel(t *testing.T) {
 	replicaLabel := "replica"
 	clusterLabel := "cluster"
 	cases := []struct {
-		labelsIn  []client.LabelAdapter
-		labelsOut []client.LabelAdapter
+		labelsIn  []cortexpb.LabelAdapter
+		labelsOut []cortexpb.LabelAdapter
 	}{
 		// Replica label is present
 		{
-			labelsIn: []client.LabelAdapter{
+			labelsIn: []cortexpb.LabelAdapter{
 				{Name: "__name__", Value: "foo"},
 				{Name: "bar", Value: "baz"},
 				{Name: "sample", Value: "1"},
 				{Name: "replica", Value: replicaLabel},
 			},
-			labelsOut: []client.LabelAdapter{
+			labelsOut: []cortexpb.LabelAdapter{
 				{Name: "__name__", Value: "foo"},
 				{Name: "bar", Value: "baz"},
 				{Name: "sample", Value: "1"},
@@ -1661,13 +1836,13 @@ func TestRemoveReplicaLabel(t *testing.T) {
 		},
 		// Replica label is not present
 		{
-			labelsIn: []client.LabelAdapter{
+			labelsIn: []cortexpb.LabelAdapter{
 				{Name: "__name__", Value: "foo"},
 				{Name: "bar", Value: "baz"},
 				{Name: "sample", Value: "1"},
 				{Name: "cluster", Value: clusterLabel},
 			},
-			labelsOut: []client.LabelAdapter{
+			labelsOut: []cortexpb.LabelAdapter{
 				{Name: "__name__", Value: "foo"},
 				{Name: "bar", Value: "baz"},
 				{Name: "sample", Value: "1"},
@@ -1684,13 +1859,13 @@ func TestRemoveReplicaLabel(t *testing.T) {
 
 // This is not great, but we deal with unsorted labels when validating labels.
 func TestShardByAllLabelsReturnsWrongResultsForUnsortedLabels(t *testing.T) {
-	val1 := shardByAllLabels("test", []client.LabelAdapter{
+	val1 := shardByAllLabels("test", []cortexpb.LabelAdapter{
 		{Name: "__name__", Value: "foo"},
 		{Name: "bar", Value: "baz"},
 		{Name: "sample", Value: "1"},
 	})
 
-	val2 := shardByAllLabels("test", []client.LabelAdapter{
+	val2 := shardByAllLabels("test", []cortexpb.LabelAdapter{
 		{Name: "__name__", Value: "foo"},
 		{Name: "sample", Value: "1"},
 		{Name: "bar", Value: "baz"},
@@ -1700,7 +1875,7 @@ func TestShardByAllLabelsReturnsWrongResultsForUnsortedLabels(t *testing.T) {
 }
 
 func TestSortLabels(t *testing.T) {
-	sorted := []client.LabelAdapter{
+	sorted := []cortexpb.LabelAdapter{
 		{Name: "__name__", Value: "foo"},
 		{Name: "bar", Value: "baz"},
 		{Name: "cluster", Value: "cluster"},
@@ -1712,7 +1887,7 @@ func TestSortLabels(t *testing.T) {
 		sortLabelsIfNeeded(sorted)
 	}))
 
-	unsorted := []client.LabelAdapter{
+	unsorted := []cortexpb.LabelAdapter{
 		{Name: "__name__", Value: "foo"},
 		{Name: "sample", Value: "1"},
 		{Name: "cluster", Value: "cluster"},
@@ -1794,7 +1969,7 @@ func TestDistributor_Push_Relabel(t *testing.T) {
 			timeseries := ingesters[i].series()
 			assert.Equal(t, 1, len(timeseries))
 			for _, v := range timeseries {
-				assert.Equal(t, tc.expectedSeries, client.FromLabelAdaptersToLabels(v.Labels))
+				assert.Equal(t, tc.expectedSeries, cortexpb.FromLabelAdaptersToLabels(v.Labels))
 			}
 		}
 	}

@@ -13,6 +13,13 @@ The store-gateway is **semi-stateful**.
 
 ## How it works
 
+The store-gateway needs to have an almost up-to-date view over the storage bucket, in order to discover blocks belonging to their shard. The store-gateway can keep the bucket view updated in to two different ways:
+
+1. Periodically scanning the bucket (default)
+2. Periodically downloading the [bucket index](./bucket-index.md)
+
+### Bucket index disabled (default)
+
 At startup **store-gateways** iterate over the entire storage bucket to discover blocks for all tenants and download the `meta.json` and index-header for each block. During this initial bucket synchronization phase, the store-gateway `/ready` readiness probe endpoint will fail.
 
 While running, store-gateways periodically rescan the storage bucket to discover new blocks (uploaded by the ingesters and [compactor](./compactor.md)) and blocks marked for deletion or fully deleted since the last scan (as a result of compaction). The frequency at which this occurs is configured via `-blocks-storage.bucket-store.sync-interval`.
@@ -20,6 +27,12 @@ While running, store-gateways periodically rescan the storage bucket to discover
 The blocks chunks and the entire index are never fully downloaded by the store-gateway. The index-header is stored to the local disk, in order to avoid to re-download it on subsequent restarts of a store-gateway. For this reason, it's recommended - but not required - to run the store-gateway with a persistent disk. For example, if you're running the Cortex cluster in Kubernetes, you may use a StatefulSet with a persistent volume claim for the store-gateways.
 
 _For more information about the index-header, please refer to [Binary index-header documentation](./binary-index-header.md)._
+
+### Bucket index enabled
+
+When bucket index is enabled, the overall workflow is the same but, instead of iterating over the bucket objects, the store-gateway fetch the [bucket index](./bucket-index.md) for each tenant belonging to their shard in order to discover each tenant's blocks and block deletion marks.
+
+_For more information about the bucket index, please refer to [bucket index documentation](./bucket-index.md)._
 
 ## Blocks sharding and replication
 
@@ -67,6 +80,18 @@ The store-gateway replication optionally supports [zone-awareness](../guides/zon
 1. Configure the availability zone for each store-gateway via the `-store-gateway.sharding-ring.instance-availability-zone` CLI flag (or its respective YAML config option)
 2. Enable blocks zone-aware replication via the `-store-gateway.sharding-ring.zone-awareness-enabled` CLI flag (or its respective YAML config option). Please be aware this configuration option should be set to store-gateways, queriers and rulers.
 3. Rollout store-gateways, queriers and rulers to apply the new configuration
+
+## Blocks index-header
+
+The [index-header](./binary-index-header.md) is a subset of the block index which the store-gateway downloads from the object storage and keeps on the local disk in order to speed up queries.
+
+At startup, the store-gateway downloads the index-header of each block belonging to its shard. A store-gateway is not ready until this initial index-header download is completed. Moreover, while running, the store-gateway periodically looks for newly uploaded blocks in the storage and downloads the index-header for the blocks belonging to its shard.
+
+### Index-header lazy loading
+
+By default, each index-header is memory mapped by the store-gateway right after downloading it. In a cluster with a large number of blocks, each store-gateway may have a large amount of memory mapped index-headers, regardless how frequently they're used at query time.
+
+Cortex supports a configuration option `-blocks-storage.bucket-store.index-header-lazy-loading-enabled=true` to enable index-header lazy loading. When enabled, index-headers will be memory mapped only once required by a query and will be automatically released after `-blocks-storage.bucket-store.index-header-lazy-loading-idle-timeout` time of inactivity.
 
 ## Caching
 
@@ -125,6 +150,7 @@ Store-gateway and [querier](./querier.md) can use memcached for caching bucket m
 - List of blocks per tenant
 - Block's `meta.json` content
 - Block's `deletion-mark.json` existence and content
+- Tenant's `bucket-index.json.gz` content
 
 Using the metadata cache can significantly reduce the number of API calls to object storage and protects from linearly scale the number of these API calls with the number of querier and store-gateway instances (because the bucket is periodically scanned and synched by each querier and store-gateway).
 
@@ -280,6 +306,20 @@ blocks_storage:
     # CLI flag: -blocks-storage.s3.signature-version
     [signature_version: <string> | default = "v4"]
 
+    sse:
+      # Enable AWS Server Side Encryption. Only SSE-S3 and SSE-KMS are supported
+      # CLI flag: -blocks-storage.s3.sse.type
+      [type: <string> | default = ""]
+
+      # KMS Key ID used to encrypt objects in S3
+      # CLI flag: -blocks-storage.s3.sse.kms-key-id
+      [kms_key_id: <string> | default = ""]
+
+      # KMS Encryption Context used for object encryption. It expects JSON
+      # formatted string.
+      # CLI flag: -blocks-storage.s3.sse.kms-encryption-context
+      [kms_encryption_context: <string> | default = ""]
+
     http:
       # The time an idle connection will remain idle before closing.
       # CLI flag: -blocks-storage.s3.http.idle-conn-timeout
@@ -293,6 +333,30 @@ blocks_storage:
       # client will accept any certificate and hostname.
       # CLI flag: -blocks-storage.s3.http.insecure-skip-verify
       [insecure_skip_verify: <boolean> | default = false]
+
+      # Maximum time to wait for a TLS handshake. 0 means no limit.
+      # CLI flag: -blocks-storage.s3.tls-handshake-timeout
+      [tls_handshake_timeout: <duration> | default = 10s]
+
+      # The time to wait for a server's first response headers after fully
+      # writing the request headers if the request has an Expect header. 0 to
+      # send the request body immediately.
+      # CLI flag: -blocks-storage.s3.expect-continue-timeout
+      [expect_continue_timeout: <duration> | default = 1s]
+
+      # Maximum number of idle (keep-alive) connections across all hosts. 0
+      # means no limit.
+      # CLI flag: -blocks-storage.s3.max-idle-connections
+      [max_idle_connections: <int> | default = 100]
+
+      # Maximum number of idle (keep-alive) connections to keep per-host. If 0,
+      # a built-in default value is used.
+      # CLI flag: -blocks-storage.s3.max-idle-connections-per-host
+      [max_idle_connections_per_host: <int> | default = 100]
+
+      # Maximum number of connections per host. 0 means no limit.
+      # CLI flag: -blocks-storage.s3.max-connections-per-host
+      [max_connections_per_host: <int> | default = 0]
 
   gcs:
     # GCS bucket name
@@ -328,6 +392,10 @@ blocks_storage:
     [max_retries: <int> | default = 20]
 
   swift:
+    # OpenStack Swift authentication API version. 0 to autodetect.
+    # CLI flag: -blocks-storage.swift.auth-version
+    [auth_version: <int> | default = 0]
+
     # OpenStack Swift authentication URL
     # CLI flag: -blocks-storage.swift.auth-url
     [auth_url: <string> | default = ""]
@@ -386,25 +454,40 @@ blocks_storage:
     # CLI flag: -blocks-storage.swift.container-name
     [container_name: <string> | default = ""]
 
+    # Max retries on requests error.
+    # CLI flag: -blocks-storage.swift.max-retries
+    [max_retries: <int> | default = 3]
+
+    # Time after which a connection attempt is aborted.
+    # CLI flag: -blocks-storage.swift.connect-timeout
+    [connect_timeout: <duration> | default = 10s]
+
+    # Time after which an idle request is aborted. The timeout watchdog is reset
+    # each time some data is received, so the timeout triggers after X time no
+    # data is received on a request.
+    # CLI flag: -blocks-storage.swift.request-timeout
+    [request_timeout: <duration> | default = 5s]
+
   filesystem:
     # Local filesystem storage directory.
     # CLI flag: -blocks-storage.filesystem.dir
     [dir: <string> | default = ""]
 
-  # This configures how the store-gateway synchronizes blocks stored in the
-  # bucket.
+  # This configures how the querier and store-gateway discover and synchronize
+  # blocks stored in the bucket.
   bucket_store:
     # Directory to store synchronized TSDB index headers.
     # CLI flag: -blocks-storage.bucket-store.sync-dir
     [sync_dir: <string> | default = "tsdb-sync"]
 
-    # How frequently scan the bucket to look for changes (new blocks shipped by
-    # ingesters and blocks removed by retention or compaction). 0 disables it.
+    # How frequently to scan the bucket, or to refresh the bucket index (if
+    # enabled), in order to look for changes (new blocks shipped by ingesters
+    # and blocks deleted by retention or compaction).
     # CLI flag: -blocks-storage.bucket-store.sync-interval
-    [sync_interval: <duration> | default = 5m]
+    [sync_interval: <duration> | default = 15m]
 
-    # Max size - in bytes - of a per-tenant chunk pool, used to reduce memory
-    # allocations.
+    # Max size - in bytes - of a chunks pool, used to reduce memory allocations.
+    # The pool is shared across all tenants.
     # CLI flag: -blocks-storage.bucket-store.max-chunk-pool-bytes
     [max_chunk_pool_bytes: <int> | default = 2147483648]
 
@@ -629,13 +712,33 @@ blocks_storage:
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-content-ttl
       [metafile_content_ttl: <duration> | default = 24h]
 
-      # Maximum size of metafile content to cache in bytes.
+      # Maximum size of metafile content to cache in bytes. Caching will be
+      # skipped if the content exceeds this size. This is useful to avoid
+      # network round trip for large content if the configured caching backend
+      # has an hard limit on cached items size (in this case, you should set
+      # this limit to the same limit in the caching backend).
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-max-size-bytes
       [metafile_max_size_bytes: <int> | default = 1048576]
 
       # How long to cache attributes of the block metafile.
       # CLI flag: -blocks-storage.bucket-store.metadata-cache.metafile-attributes-ttl
       [metafile_attributes_ttl: <duration> | default = 168h]
+
+      # How long to cache attributes of the block index.
+      # CLI flag: -blocks-storage.bucket-store.metadata-cache.block-index-attributes-ttl
+      [block_index_attributes_ttl: <duration> | default = 168h]
+
+      # How long to cache content of the bucket index.
+      # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-content-ttl
+      [bucket_index_content_ttl: <duration> | default = 5m]
+
+      # Maximum size of bucket index content to cache in bytes. Caching will be
+      # skipped if the content exceeds this size. This is useful to avoid
+      # network round trip for large content if the configured caching backend
+      # has an hard limit on cached items size (in this case, you should set
+      # this limit to the same limit in the caching backend).
+      # CLI flag: -blocks-storage.bucket-store.metadata-cache.bucket-index-max-size-bytes
+      [bucket_index_max_size_bytes: <int> | default = 1048576]
 
     # Duration after which the blocks marked for deletion will be filtered out
     # while fetching blocks. The idea of ignore-deletion-marks-delay is to
@@ -645,6 +748,41 @@ blocks_storage:
     # -compactor.deletion-delay.
     # CLI flag: -blocks-storage.bucket-store.ignore-deletion-marks-delay
     [ignore_deletion_mark_delay: <duration> | default = 6h]
+
+    bucket_index:
+      # True to enable querier and store-gateway to discover blocks in the
+      # storage via bucket index instead of bucket scanning.
+      # CLI flag: -blocks-storage.bucket-store.bucket-index.enabled
+      [enabled: <boolean> | default = false]
+
+      # How frequently a bucket index, which previously failed to load, should
+      # be tried to load again. This option is used only by querier.
+      # CLI flag: -blocks-storage.bucket-store.bucket-index.update-on-error-interval
+      [update_on_error_interval: <duration> | default = 1m]
+
+      # How long a unused bucket index should be cached. Once this timeout
+      # expires, the unused bucket index is removed from the in-memory cache.
+      # This option is used only by querier.
+      # CLI flag: -blocks-storage.bucket-store.bucket-index.idle-timeout
+      [idle_timeout: <duration> | default = 1h]
+
+      # The maximum allowed age of a bucket index (last updated) before queries
+      # start failing because the bucket index is too old. The bucket index is
+      # periodically updated by the compactor, while this check is enforced in
+      # the querier (at query time).
+      # CLI flag: -blocks-storage.bucket-store.bucket-index.max-stale-period
+      [max_stale_period: <duration> | default = 1h]
+
+    # If enabled, store-gateway will lazy load an index-header only once
+    # required by a query.
+    # CLI flag: -blocks-storage.bucket-store.index-header-lazy-loading-enabled
+    [index_header_lazy_loading_enabled: <boolean> | default = false]
+
+    # If index-header lazy loading is enabled and this setting is > 0, the
+    # store-gateway will offload unused index-headers after 'idle timeout'
+    # inactivity.
+    # CLI flag: -blocks-storage.bucket-store.index-header-lazy-loading-idle-timeout
+    [index_header_lazy_loading_idle_timeout: <duration> | default = 20m]
 
   tsdb:
     # Local directory to store TSDBs in the ingesters.
