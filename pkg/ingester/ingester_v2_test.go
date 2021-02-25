@@ -1810,7 +1810,7 @@ func TestIngester_dontShipBlocksWhenTenantDeletionMarkerIsPresent(t *testing.T) 
 	numObjects := len(bucket.Objects())
 	require.NotZero(t, numObjects)
 
-	require.NoError(t, cortex_tsdb.WriteTenantDeletionMark(context.Background(), bucket, userID, cortex_tsdb.NewTenantDeletionMark(time.Now())))
+	require.NoError(t, cortex_tsdb.WriteTenantDeletionMark(context.Background(), bucket, userID, nil, cortex_tsdb.NewTenantDeletionMark(time.Now())))
 	numObjects++ // For deletion marker
 
 	db := i.getTSDB(userID)
@@ -2192,7 +2192,7 @@ func TestIngester_ForFlush(t *testing.T) {
 
 	// Restart ingester in "For Flusher" mode. We reuse the same config (esp. same dir)
 	reg = prometheus.NewPedanticRegistry()
-	i, err = NewV2ForFlusher(i.cfg, reg, log.NewNopLogger())
+	i, err = NewV2ForFlusher(i.cfg, i.limits, reg, log.NewNopLogger())
 	require.NoError(t, err)
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
 
@@ -2373,8 +2373,8 @@ func TestIngesterCompactIdleBlock(t *testing.T) {
 		cortex_ingester_memory_users 1
     `), memSeriesCreatedTotalName, memSeriesRemovedTotalName, "cortex_ingester_memory_users"))
 
-	// wait one second -- TSDB is now idle.
-	time.Sleep(cfg.BlocksStorageConfig.TSDB.HeadCompactionIdleTimeout)
+	// wait one second (plus maximum jitter) -- TSDB is now idle.
+	time.Sleep(time.Duration(float64(cfg.BlocksStorageConfig.TSDB.HeadCompactionIdleTimeout) * (1 + compactionIdleTimeoutJitter)))
 
 	i.compactBlocks(context.Background(), false)
 	verifyCompactedHead(t, i, true)

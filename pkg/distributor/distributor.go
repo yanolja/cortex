@@ -37,77 +37,6 @@ import (
 )
 
 var (
-	queryDuration = instrument.NewHistogramCollector(promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "cortex",
-		Name:      "distributor_query_duration_seconds",
-		Help:      "Time spent executing expression queries.",
-		Buckets:   []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30},
-	}, []string{"method", "status_code"}))
-	receivedSamples = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_received_samples_total",
-		Help:      "The total number of received samples, excluding rejected and deduped samples.",
-	}, []string{"user"})
-	receivedMetadata = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_received_metadata_total",
-		Help:      "The total number of received metadata, excluding rejected.",
-	}, []string{"user"})
-	incomingSamples = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_samples_in_total",
-		Help:      "The total number of samples that have come in to the distributor, including rejected or deduped samples.",
-	}, []string{"user"})
-	incomingMetadata = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_metadata_in_total",
-		Help:      "The total number of metadata the have come in to the distributor, including rejected.",
-	}, []string{"user"})
-	nonHASamples = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_non_ha_samples_received_total",
-		Help:      "The total number of received samples for a user that has HA tracking turned on, but the sample didn't contain both HA labels.",
-	}, []string{"user"})
-	dedupedSamples = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_deduped_samples_total",
-		Help:      "The total number of deduplicated samples.",
-	}, []string{"user", "cluster"})
-	labelsHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "cortex",
-		Name:      "labels_per_sample",
-		Help:      "Number of labels per sample.",
-		Buckets:   []float64{5, 10, 15, 20, 25},
-	})
-	ingesterAppends = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_ingester_appends_total",
-		Help:      "The total number of batch appends sent to ingesters.",
-	}, []string{"ingester", "type"})
-	ingesterAppendFailures = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_ingester_append_failures_total",
-		Help:      "The total number of failed batch appends sent to ingesters.",
-	}, []string{"ingester", "type"})
-	ingesterQueries = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_ingester_queries_total",
-		Help:      "The total number of queries sent to ingesters.",
-	}, []string{"ingester"})
-	ingesterQueryFailures = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "cortex",
-		Name:      "distributor_ingester_query_failures_total",
-		Help:      "The total number of failed queries sent to ingesters.",
-	}, []string{"ingester"})
-	replicationFactor = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "cortex",
-		Name:      "distributor_replication_factor",
-		Help:      "The configured replication factor.",
-	})
-	latestSeenSampleTimestampPerUser = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "cortex_distributor_latest_seen_sample_timestamp_seconds",
-		Help: "Unix timestamp of latest received sample per user.",
-	}, []string{"user"})
 	emptyPreallocSeries = ingester_client.PreallocTimeseries{}
 
 	supportedShardingStrategies = []string{util.ShardingStrategyDefault, util.ShardingStrategyShuffle}
@@ -115,9 +44,6 @@ var (
 	// Validation errors.
 	errInvalidShardingStrategy = errors.New("invalid sharding strategy")
 	errInvalidTenantShardSize  = errors.New("invalid tenant shard size, the value must be greater than 0")
-
-	inactiveUserTimeout    = 15 * time.Minute
-	metricsCleanupInterval = inactiveUserTimeout / 5
 )
 
 const (
@@ -150,7 +76,23 @@ type Distributor struct {
 	subservices        *services.Manager
 	subservicesWatcher *services.FailureWatcher
 
-	activeUsers *util.ActiveUsers
+	activeUsers *util.ActiveUsersCleanupService
+
+	// Metrics
+	queryDuration                    *instrument.HistogramCollector
+	receivedSamples                  *prometheus.CounterVec
+	receivedMetadata                 *prometheus.CounterVec
+	incomingSamples                  *prometheus.CounterVec
+	incomingMetadata                 *prometheus.CounterVec
+	nonHASamples                     *prometheus.CounterVec
+	dedupedSamples                   *prometheus.CounterVec
+	labelsHistogram                  prometheus.Histogram
+	ingesterAppends                  *prometheus.CounterVec
+	ingesterAppendFailures           *prometheus.CounterVec
+	ingesterQueries                  *prometheus.CounterVec
+	ingesterQueryFailures            *prometheus.CounterVec
+	replicationFactor                prometheus.Gauge
+	latestSeenSampleTimestampPerUser *prometheus.GaugeVec
 }
 
 // Config contains the configuration required to
@@ -217,7 +159,6 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 		}
 	}
 
-	replicationFactor.Set(float64(ingestersRing.ReplicationFactor()))
 	cfg.PoolConfig.RemoteTimeout = cfg.RemoteTimeout
 
 	haTracker, err := newHATracker(cfg.HATrackerConfig, limits, reg, log)
@@ -258,10 +199,83 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 		limits:               limits,
 		ingestionRateLimiter: limiter.NewRateLimiter(ingestionRateStrategy, 10*time.Second),
 		HATracker:            haTracker,
-		activeUsers:          util.NewActiveUsers(),
-	}
 
-	subservices = append(subservices, d.ingesterPool)
+		queryDuration: instrument.NewHistogramCollector(promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "cortex",
+			Name:      "distributor_query_duration_seconds",
+			Help:      "Time spent executing expression queries.",
+			Buckets:   []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30},
+		}, []string{"method", "status_code"})),
+		receivedSamples: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_received_samples_total",
+			Help:      "The total number of received samples, excluding rejected and deduped samples.",
+		}, []string{"user"}),
+		receivedMetadata: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_received_metadata_total",
+			Help:      "The total number of received metadata, excluding rejected.",
+		}, []string{"user"}),
+		incomingSamples: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_samples_in_total",
+			Help:      "The total number of samples that have come in to the distributor, including rejected or deduped samples.",
+		}, []string{"user"}),
+		incomingMetadata: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_metadata_in_total",
+			Help:      "The total number of metadata the have come in to the distributor, including rejected.",
+		}, []string{"user"}),
+		nonHASamples: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_non_ha_samples_received_total",
+			Help:      "The total number of received samples for a user that has HA tracking turned on, but the sample didn't contain both HA labels.",
+		}, []string{"user"}),
+		dedupedSamples: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_deduped_samples_total",
+			Help:      "The total number of deduplicated samples.",
+		}, []string{"user", "cluster"}),
+		labelsHistogram: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+			Namespace: "cortex",
+			Name:      "labels_per_sample",
+			Help:      "Number of labels per sample.",
+			Buckets:   []float64{5, 10, 15, 20, 25},
+		}),
+		ingesterAppends: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_ingester_appends_total",
+			Help:      "The total number of batch appends sent to ingesters.",
+		}, []string{"ingester", "type"}),
+		ingesterAppendFailures: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_ingester_append_failures_total",
+			Help:      "The total number of failed batch appends sent to ingesters.",
+		}, []string{"ingester", "type"}),
+		ingesterQueries: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_ingester_queries_total",
+			Help:      "The total number of queries sent to ingesters.",
+		}, []string{"ingester"}),
+		ingesterQueryFailures: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: "cortex",
+			Name:      "distributor_ingester_query_failures_total",
+			Help:      "The total number of failed queries sent to ingesters.",
+		}, []string{"ingester"}),
+		replicationFactor: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Namespace: "cortex",
+			Name:      "distributor_replication_factor",
+			Help:      "The configured replication factor.",
+		}),
+		latestSeenSampleTimestampPerUser: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cortex_distributor_latest_seen_sample_timestamp_seconds",
+			Help: "Unix timestamp of latest received sample per user.",
+		}, []string{"user"}),
+	}
+	d.replicationFactor.Set(float64(ingestersRing.ReplicationFactor()))
+	d.activeUsers = util.NewActiveUsersCleanupWithDefaultValues(d.cleanupInactiveUser)
+
+	subservices = append(subservices, d.ingesterPool, d.activeUsers)
 	d.subservices, err = services.NewManager(subservices...)
 	if err != nil {
 		return nil, err
@@ -279,19 +293,8 @@ func (d *Distributor) starting(ctx context.Context) error {
 }
 
 func (d *Distributor) running(ctx context.Context) error {
-	metricsCleanupTimer := time.NewTicker(metricsCleanupInterval)
-	defer metricsCleanupTimer.Stop()
-
 	for {
 		select {
-		case <-metricsCleanupTimer.C:
-			inactiveUsers := d.activeUsers.PurgeInactiveUsers(time.Now().Add(-inactiveUserTimeout).UnixNano())
-			for _, userID := range inactiveUsers {
-				cleanupMetricsForUser(userID, d.log)
-				d.HATracker.cleanupHATrackerMetricsForUser(userID)
-			}
-			continue
-
 		case <-ctx.Done():
 			return nil
 
@@ -301,19 +304,23 @@ func (d *Distributor) running(ctx context.Context) error {
 	}
 }
 
-func cleanupMetricsForUser(userID string, log log.Logger) {
-	receivedSamples.DeleteLabelValues(userID)
-	receivedMetadata.DeleteLabelValues(userID)
-	incomingSamples.DeleteLabelValues(userID)
-	incomingMetadata.DeleteLabelValues(userID)
-	nonHASamples.DeleteLabelValues(userID)
-	latestSeenSampleTimestampPerUser.DeleteLabelValues(userID)
+func (d *Distributor) cleanupInactiveUser(userID string) {
+	d.ingestersRing.CleanupShuffleShardCache(userID)
 
-	if err := util.DeleteMatchingLabels(dedupedSamples, map[string]string{"user": userID}); err != nil {
-		level.Warn(log).Log("msg", "failed to remove cortex_distributor_deduped_samples_total metric for user", "user", userID, "err", err)
+	d.HATracker.cleanupHATrackerMetricsForUser(userID)
+
+	d.receivedSamples.DeleteLabelValues(userID)
+	d.receivedMetadata.DeleteLabelValues(userID)
+	d.incomingSamples.DeleteLabelValues(userID)
+	d.incomingMetadata.DeleteLabelValues(userID)
+	d.nonHASamples.DeleteLabelValues(userID)
+	d.latestSeenSampleTimestampPerUser.DeleteLabelValues(userID)
+
+	if err := util.DeleteMatchingLabels(d.dedupedSamples, map[string]string{"user": userID}); err != nil {
+		level.Warn(d.log).Log("msg", "failed to remove cortex_distributor_deduped_samples_total metric for user", "user", userID, "err", err)
 	}
 
-	validation.DeletePerUserValidationMetrics(userID, log)
+	validation.DeletePerUserValidationMetrics(userID, d.log)
 }
 
 // Called after distributor is asked to stop via StopAsync.
@@ -403,7 +410,7 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 // any are configured to be dropped for the user ID.
 // Returns the validated series with it's labels/samples, and any error.
 func (d *Distributor) validateSeries(ts ingester_client.PreallocTimeseries, userID string, skipLabelNameValidation bool) (ingester_client.PreallocTimeseries, error) {
-	labelsHistogram.Observe(float64(len(ts.Labels)))
+	d.labelsHistogram.Observe(float64(len(ts.Labels)))
 	if err := validation.ValidateLabels(d.limits, userID, ts.Labels, skipLabelNameValidation); err != nil {
 		return emptyPreallocSeries, err
 	}
@@ -434,7 +441,7 @@ func (d *Distributor) Push(ctx context.Context, req *ingester_client.WriteReques
 	}
 
 	now := time.Now()
-	d.activeUsers.UpdateUserTimestamp(userID, now.UnixNano())
+	d.activeUsers.UpdateUserTimestamp(userID, now)
 
 	source := util.GetSourceIPsFromOutgoingCtx(ctx)
 
@@ -446,9 +453,9 @@ func (d *Distributor) Push(ctx context.Context, req *ingester_client.WriteReques
 		numSamples += len(ts.Samples)
 	}
 	// Count the total samples in, prior to validation or deduplication, for comparison with other metrics.
-	incomingSamples.WithLabelValues(userID).Add(float64(numSamples))
+	d.incomingSamples.WithLabelValues(userID).Add(float64(numSamples))
 	// Count the total number of metadata in.
-	incomingMetadata.WithLabelValues(userID).Add(float64(len(req.Metadata)))
+	d.incomingMetadata.WithLabelValues(userID).Add(float64(len(req.Metadata)))
 
 	// A WriteRequest can only contain series or metadata but not both. This might change in the future.
 	// For each timeseries or samples, we compute a hash to distribute across ingesters;
@@ -468,7 +475,7 @@ func (d *Distributor) Push(ctx context.Context, req *ingester_client.WriteReques
 
 			if errors.Is(err, replicasNotMatchError{}) {
 				// These samples have been deduped.
-				dedupedSamples.WithLabelValues(userID, cluster).Add(float64(numSamples))
+				d.dedupedSamples.WithLabelValues(userID, cluster).Add(float64(numSamples))
 				return nil, httpgrpc.Errorf(http.StatusAccepted, err.Error())
 			}
 
@@ -481,7 +488,7 @@ func (d *Distributor) Push(ctx context.Context, req *ingester_client.WriteReques
 		}
 		// If there wasn't an error but removeReplica is false that means we didn't find both HA labels.
 		if !removeReplica {
-			nonHASamples.WithLabelValues(userID).Add(float64(numSamples))
+			d.nonHASamples.WithLabelValues(userID).Add(float64(numSamples))
 		}
 	}
 
@@ -489,7 +496,7 @@ func (d *Distributor) Push(ctx context.Context, req *ingester_client.WriteReques
 	defer func() {
 		// Update this metric even in case of errors.
 		if latestSampleTimestampMs > 0 {
-			latestSeenSampleTimestampPerUser.WithLabelValues(userID).Set(float64(latestSampleTimestampMs) / 1000)
+			d.latestSeenSampleTimestampPerUser.WithLabelValues(userID).Set(float64(latestSampleTimestampMs) / 1000)
 		}
 	}()
 
@@ -569,8 +576,8 @@ func (d *Distributor) Push(ctx context.Context, req *ingester_client.WriteReques
 		validatedMetadata = append(validatedMetadata, m)
 	}
 
-	receivedSamples.WithLabelValues(userID).Add(float64(validatedSamples))
-	receivedMetadata.WithLabelValues(userID).Add(float64(len(validatedMetadata)))
+	d.receivedSamples.WithLabelValues(userID).Add(float64(validatedSamples))
+	d.receivedMetadata.WithLabelValues(userID).Add(float64(len(validatedMetadata)))
 
 	if len(seriesKeys) == 0 && len(metadataKeys) == 0 {
 		// Ensure the request slice is reused if there's no series or metadata passing the validation.
@@ -677,15 +684,15 @@ func (d *Distributor) send(ctx context.Context, ingester ring.InstanceDesc, time
 	_, err = c.Push(ctx, &req)
 
 	if len(metadata) > 0 {
-		ingesterAppends.WithLabelValues(ingester.Addr, typeMetadata).Inc()
+		d.ingesterAppends.WithLabelValues(ingester.Addr, typeMetadata).Inc()
 		if err != nil {
-			ingesterAppendFailures.WithLabelValues(ingester.Addr, typeMetadata).Inc()
+			d.ingesterAppendFailures.WithLabelValues(ingester.Addr, typeMetadata).Inc()
 		}
 	}
 	if len(timeseries) > 0 {
-		ingesterAppends.WithLabelValues(ingester.Addr, typeSamples).Inc()
+		d.ingesterAppends.WithLabelValues(ingester.Addr, typeSamples).Inc()
 		if err != nil {
-			ingesterAppendFailures.WithLabelValues(ingester.Addr, typeSamples).Inc()
+			d.ingesterAppendFailures.WithLabelValues(ingester.Addr, typeSamples).Inc()
 		}
 	}
 

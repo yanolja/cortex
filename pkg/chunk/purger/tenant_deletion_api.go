@@ -20,26 +20,32 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
-type BlocksPurgerAPI struct {
+type TenantDeletionAPI struct {
 	bucketClient objstore.Bucket
 	ruleStore    rules.RuleStore
 	logger       log.Logger
+	cfgProvider  bucket.TenantConfigProvider
 }
 
-func NewBlocksPurgerAPI(storageCfg cortex_tsdb.BlocksStorageConfig, ruleStore rules.RuleStore, logger log.Logger, reg prometheus.Registerer) (*BlocksPurgerAPI, error) {
+func NewTenantDeletionAPI(storageCfg cortex_tsdb.BlocksStorageConfig, cfgProvider bucket.TenantConfigProvider, ruleStore rules.RuleStore, logger log.Logger, reg prometheus.Registerer) (*TenantDeletionAPI, error) {
 	bucketClient, err := createBucketClient(storageCfg, logger, reg)
 	if err != nil {
 		return nil, err
 	}
 
-	return newBlocksPurgerAPI(bucketClient, ruleStore, logger), nil
+	return newTenantDeletionAPI(bucketClient, cfgProvider, ruleStore, logger), nil
 }
 
-func newBlocksPurgerAPI(bkt objstore.Bucket, ruleStore rules.RuleStore, logger log.Logger) *BlocksPurgerAPI {
-	return &BlocksPurgerAPI{bucketClient: bkt, ruleStore: ruleStore, logger: logger}
+func newTenantDeletionAPI(bkt objstore.Bucket, cfgProvider bucket.TenantConfigProvider, ruleStore rules.RuleStore, logger log.Logger) *TenantDeletionAPI {
+	return &TenantDeletionAPI{
+		bucketClient: bkt,
+		ruleStore:    ruleStore,
+		cfgProvider:  cfgProvider,
+		logger:       logger,
+	}
 }
 
-func (api *BlocksPurgerAPI) DeleteTenant(w http.ResponseWriter, r *http.Request) {
+func (api *TenantDeletionAPI) DeleteTenant(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
@@ -47,7 +53,7 @@ func (api *BlocksPurgerAPI) DeleteTenant(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	err = cortex_tsdb.WriteTenantDeletionMark(r.Context(), api.bucketClient, userID, cortex_tsdb.NewTenantDeletionMark(time.Now()))
+	err = cortex_tsdb.WriteTenantDeletionMark(r.Context(), api.bucketClient, userID, api.cfgProvider, cortex_tsdb.NewTenantDeletionMark(time.Now()))
 	if err != nil {
 		level.Error(api.logger).Log("msg", "failed to write tenant deletion mark", "user", userID, "err", err)
 
@@ -69,7 +75,7 @@ func (api *BlocksPurgerAPI) DeleteTenant(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusOK)
 }
 
-func (api *BlocksPurgerAPI) deleteRules(ctx context.Context, userID string) error {
+func (api *TenantDeletionAPI) deleteRules(ctx context.Context, userID string) error {
 	if !api.ruleStore.SupportsModifications() {
 		level.Warn(api.logger).Log("msg", "cannot delete tenant rule groups, using read-only rule store", "user", userID)
 		return nil
@@ -91,7 +97,7 @@ type DeleteTenantStatusResponse struct {
 	AlertManagerConfigDeleted bool   `json:"alert_manager_config_deleted,omitempty"` // Not yet supported.
 }
 
-func (api *BlocksPurgerAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.Request) {
+func (api *TenantDeletionAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
@@ -116,9 +122,9 @@ func (api *BlocksPurgerAPI) DeleteTenantStatus(w http.ResponseWriter, r *http.Re
 	util.WriteJSONResponse(w, result)
 }
 
-func (api *BlocksPurgerAPI) isRulesForUserDeleted(ctx context.Context, userID string) (bool, error) {
+func (api *TenantDeletionAPI) isRulesForUserDeleted(ctx context.Context, userID string) (bool, error) {
 	if api.ruleStore == nil {
-		// If purger doesn't have access to rule store, then we cannot say that rules have been deleted.
+		// If API doesn't have access to rule store, then we cannot say that rules have been deleted.
 		return false, nil
 	}
 
@@ -130,10 +136,10 @@ func (api *BlocksPurgerAPI) isRulesForUserDeleted(ctx context.Context, userID st
 	return len(list) == 0, nil
 }
 
-func (api *BlocksPurgerAPI) isBlocksForUserDeleted(ctx context.Context, userID string) (bool, error) {
+func (api *TenantDeletionAPI) isBlocksForUserDeleted(ctx context.Context, userID string) (bool, error) {
 	var errBlockFound = errors.New("block found")
 
-	userBucket := bucket.NewUserBucketClient(userID, api.bucketClient)
+	userBucket := bucket.NewUserBucketClient(userID, api.bucketClient, api.cfgProvider)
 	err := userBucket.Iter(ctx, "", func(s string) error {
 		s = strings.TrimSuffix(s, "/")
 

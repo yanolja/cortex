@@ -283,6 +283,11 @@ blocks_storage:
     # CLI flag: -blocks-storage.s3.endpoint
     [endpoint: <string> | default = ""]
 
+    # S3 region. If unset, the client will issue a S3 GetBucketLocation API call
+    # to autodetect it.
+    # CLI flag: -blocks-storage.s3.region
+    [region: <string> | default = ""]
+
     # S3 bucket name
     # CLI flag: -blocks-storage.s3.bucket-name
     [bucket_name: <string> | default = ""]
@@ -306,19 +311,9 @@ blocks_storage:
     # CLI flag: -blocks-storage.s3.signature-version
     [signature_version: <string> | default = "v4"]
 
-    sse:
-      # Enable AWS Server Side Encryption. Only SSE-S3 and SSE-KMS are supported
-      # CLI flag: -blocks-storage.s3.sse.type
-      [type: <string> | default = ""]
-
-      # KMS Key ID used to encrypt objects in S3
-      # CLI flag: -blocks-storage.s3.sse.kms-key-id
-      [kms_key_id: <string> | default = ""]
-
-      # KMS Encryption Context used for object encryption. It expects JSON
-      # formatted string.
-      # CLI flag: -blocks-storage.s3.sse.kms-encryption-context
-      [kms_encryption_context: <string> | default = ""]
+    # The s3_sse_config configures the S3 server-side encryption.
+    # The CLI flags prefix for this block config is: blocks-storage
+    [sse: <s3_sse_config>]
 
     http:
       # The time an idle connection will remain idle before closing.
@@ -819,7 +814,9 @@ blocks_storage:
     # CLI flag: -blocks-storage.tsdb.head-compaction-concurrency
     [head_compaction_concurrency: <int> | default = 5]
 
-    # If TSDB head is idle for this duration, it is compacted. 0 means disabled.
+    # If TSDB head is idle for this duration, it is compacted. Note that up to
+    # 25% jitter is added to the value to avoid ingesters compacting
+    # concurrently. 0 means disabled.
     # CLI flag: -blocks-storage.tsdb.head-compaction-idle-timeout
     [head_compaction_idle_timeout: <duration> | default = 1h]
 
