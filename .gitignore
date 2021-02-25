@@ -25,3 +25,5 @@ Makefile.local
 .idea
 compose
 compose-simple
+
+.github
